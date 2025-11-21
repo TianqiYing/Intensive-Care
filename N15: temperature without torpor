@@ -1,0 +1,97 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+FAST_START = pd.Timestamp("2023-09-05 12:00")   # fasting start time
+MOUSE_FILE = "N15.xlsx"
+
+
+def load_n15_baseline():
+    project_dir = Path(__file__).resolve().parent
+    file_path = project_dir / MOUSE_FILE
+
+    print(f"Reading file: {file_path}")
+    df = pd.read_excel(file_path)
+
+    # auto-detect time and temperature columns
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
+
+    time_col = None
+    temp_col = None
+    for c in df.columns:
+        if "time" in c:
+            time_col = c
+        if "temp" in c:
+            temp_col = c
+
+    if time_col is None or temp_col is None:
+        raise ValueError("Could not find time/temperature columns in N15.xlsx")
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col, temp_col]).sort_values(time_col)
+
+    # baseline = data before fasting
+    df_base = df[df[time_col] < FAST_START].copy()
+    if len(df_base) < 100:
+        raise ValueError(f"Too few baseline points: {len(df_base)}")
+
+    return df_base, time_col, temp_col
+
+
+def plot_hourly_mean_curve_periodic(df_base: pd.DataFrame, time_col: str, temp_col: str):
+    """Plot N15 baseline: hourly means + periodic smoothed curve."""
+    # time of day in hours [0, 24)
+    tod = (
+        df_base[time_col].dt.hour
+        + df_base[time_col].dt.minute / 60.0
+        + df_base[time_col].dt.second / 3600.0
+    )
+    temp = df_base[temp_col].astype(float)
+
+    df_tod = pd.DataFrame({"tod": tod, "temp": temp})
+    df_tod["tod_hour"] = df_tod["tod"].round().astype(int) % 24
+
+    # hourly means: 24 points
+    hour_means = df_tod.groupby("tod_hour")["temp"].mean().sort_index()
+
+    # periodic moving average on 24 hourly means
+    t_hours = np.arange(24)
+    temps = hour_means.values.astype(float)
+
+    window = 5          # odd number, larger -> smoother
+    half = window // 2
+    temps_smooth_hour = np.zeros_like(temps)
+
+    for i in range(24):
+        idxs = (np.arange(i - half, i + half + 1) % 24)
+        temps_smooth_hour[i] = temps[idxs].mean()
+
+    t_fine = np.linspace(0.0, 23.0, 240)
+    temps_smooth_fine = np.interp(t_fine, t_hours, temps_smooth_hour)
+
+    # plot
+    plt.figure(figsize=(8, 4))
+    plt.scatter(hour_means.index, hour_means.values,
+                color="tab:blue", label="hourly means", zorder=3)
+    plt.plot(t_fine, temps_smooth_fine,
+             color="tab:orange", label="periodic smoothed curve", zorder=2)
+
+    plt.xlabel("Hour of day")
+    plt.ylabel("Temperature (°C)")
+    plt.title("N15 baseline: temperature vs time of day (periodic smoothing)")
+    plt.xticks(range(0, 24, 2))
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    df_base, time_col, temp_col = load_n15_baseline()
+    plot_hourly_mean_curve_periodic(df_base, time_col, temp_col)
+
+
+if __name__ == "__main__":
+    main()
