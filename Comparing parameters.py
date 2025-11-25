@@ -9,10 +9,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 
-# Load cleaned data from earlier steps
+
 file_path = '4Nov2023.xlsx'  # Edit this for correct file 
 
-# Read properly: header row is row 1, actual headers in row 2
+
 df0 = pd.read_excel(file_path, header=1)
 new_cols = df0.iloc[0]
 df = df0[1:].copy()
@@ -26,7 +26,7 @@ for col in df.columns:
     if col != 'Time Stamp':
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-# Standardize each parameter so shapes can be compared
+# Standardize each parameter so it can be compared
 scaler = StandardScaler()
 
 mice = ['F1gpa','F2gpa','F3gpa','F4gpa','F5gpa','F6gpa']
@@ -51,4 +51,5 @@ for mouse in mice:
     plt.tight_layout()
     plt.savefig(f"{mouse}_normalized_plot.png", dpi=300, bbox_inches="tight")
     plt.show()
+
 
