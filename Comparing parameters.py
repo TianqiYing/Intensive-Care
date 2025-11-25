@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 
 # Load cleaned data from earlier steps
-file_path = '4Nov2023.xlsx'
+file_path = '4Nov2023.xlsx'  # Edit this for correct file 
 
 # Read properly: header row is row 1, actual headers in row 2
 df0 = pd.read_excel(file_path, header=1)
@@ -51,3 +51,4 @@ for mouse in mice:
     plt.tight_layout()
     plt.savefig(f"{mouse}_normalized_plot.png", dpi=300, bbox_inches="tight")
     plt.show()
+
