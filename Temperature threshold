@@ -1,0 +1,103 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+import matplotlib.pyplot as plt
+
+FAST_START = pd.Timestamp("2023-09-05 12:00")
+
+
+def load_mouse(path: str):
+    df = pd.read_excel(path)
+
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
+
+    time_col = [c for c in df.columns if "time" in c][0]
+    temp_col = [c for c in df.columns if "temp" in c][0]
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col, temp_col]).sort_values(time_col)
+
+    return df, time_col, temp_col
+
+baseline_t_list = []
+post_t_list = []
+
+for path in sorted(glob.glob("N*.xlsx")):
+    name = os.path.splitext(os.path.basename(path))[0]
+    df, time_col, temp_col = load_mouse(path)
+
+    # baseline
+    base = df[df[time_col] < FAST_START]
+    if len(base) == 0:
+        continue
+    baseline_t_list.append(base[temp_col].values)
+
+    # post-fast
+    post = df[
+        (df[time_col] >= FAST_START) &
+        (df[time_col] <= FAST_START + pd.Timedelta(hours=24))
+    ]
+    if len(post):
+        post_t_list.append(post[temp_col].values)
+
+baseline_t = np.concatenate(baseline_t_list)
+post_t = np.concatenate(post_t_list)
+
+baseline_stats = {
+    "n": int(len(baseline_t)),
+    "mean": float(baseline_t.mean()),
+    "std": float(baseline_t.std(ddof=1)),
+    "min": float(baseline_t.min()),
+    "max": float(baseline_t.max()),
+    "p0_1": float(np.percentile(baseline_t, 0.1)),
+    "p1": float(np.percentile(baseline_t, 1)),
+}
+
+baseline_percentiles = {
+    p: float(np.percentile(baseline_t, p))
+    for p in [2, 2.5, 5, 10, 25, 50, 75, 90, 95, 97.5]
+}
+
+post_stats = {
+    "n": int(len(post_t)),
+    "mean": float(post_t.mean()),
+    "std": float(post_t.std(ddof=1)),
+    "min": float(post_t.min()),
+    "max": float(post_t.max()),
+    "p0_1": float(np.percentile(post_t, 0.1)),
+    "p1": float(np.percentile(post_t, 1)),
+    "p10": float(np.percentile(post_t, 10)),
+    "p25": float(np.percentile(post_t, 25)),
+    "p50": float(np.percentile(post_t, 50)),
+}
+
+def frac_below(thr, arr):
+    return float((arr < thr).mean())
+
+thresholds = [30, 32, 34, 34.5, 35]
+
+summary = {
+    thr: dict(
+        baseline_frac=frac_below(thr, baseline_t),
+        post_frac=frac_below(thr, post_t),
+    )
+    for thr in thresholds
+}
+
+for thr, s in summary.items():
+    print(
+        f"T = {thr}°C:  baseline <T: {s['baseline_frac']*100:.2f}%  "
+        f"post-fast <T: {s['post_frac']*100:.2f}%"
+    )
+
+plt.figure(figsize=(6, 4))
+plt.hist(baseline_t, bins=80, alpha=0.6, label="baseline")
+plt.hist(post_t, bins=80, alpha=0.6, label="0–24h post-fast")
+plt.axvline(34, color="red", linestyle="--", label="34°C")
+plt.xlabel("Temperature (°C)")
+plt.ylabel("Count")
+plt.legend()
+plt.tight_layout()
+plt.show()
