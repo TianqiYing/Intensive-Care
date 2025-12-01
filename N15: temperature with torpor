@@ -1,0 +1,153 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+FAST_START = pd.Timestamp("2023-09-05 12:00")
+THRESHOLD = 34.0
+
+
+def load_n15():
+    project_dir = Path(__file__).resolve().parent
+    file_path = project_dir / "N15.xlsx"
+    df = pd.read_excel(file_path)
+
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
+
+    time_col = [c for c in df.columns if "time" in c][0]
+    temp_col = [c for c in df.columns if "temp" in c][0]
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col, temp_col]).sort_values(time_col)
+
+    return df, time_col, temp_col
+
+
+def detect_main_torpor_bout(df, time_col, temp_col,
+                            threshold=THRESHOLD,
+                            max_hours_after_fast=48.0):
+    df2 = df.copy()
+    df2["t_hours"] = (df2[time_col] - FAST_START).dt.total_seconds() / 3600.0
+
+    df2 = df2[(df2["t_hours"] >= 0) & (df2["t_hours"] <= max_hours_after_fast)]
+
+    mask = df2[temp_col] < threshold
+    if not mask.any():
+        raise RuntimeError("No data points below threshold; no torpor detected.")
+
+    df2 = df2.copy()
+    df2["below_thr"] = mask
+
+    df_t = df2[df2["below_thr"]].copy()
+    df_t["grp"] = (df_t["below_thr"] != df_t["below_thr"].shift()).cumsum()
+    sizes = df_t.groupby("grp").size()
+    main_grp = sizes.idxmax()
+
+    bout = df_t[df_t["grp"] == main_grp].copy()
+    return bout
+
+
+def fit_exp_cooling(t, T):
+    T_inf = T.min()
+    y = np.log(T - T_inf + 1e-6)
+
+    A = np.vstack([np.ones_like(t), t]).T
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    intercept, slope = beta
+    tau = -1.0 / slope  # y = lnC - t/tau
+
+    return dict(T_inf=T_inf,
+                lnC=float(intercept),
+                tau=float(tau))
+
+
+def fit_exp_warming(t, T):
+
+    T_inf = T.max()
+    y = np.log(T_inf - T + 1e-6)
+
+    A = np.vstack([np.ones_like(t), t]).T
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    intercept, slope = beta
+    tau = -1.0 / slope
+
+    return dict(T_inf=T_inf,
+                lnC=float(intercept),
+                tau=float(tau))
+
+
+def main():
+    df, time_col, temp_col = load_n15()
+
+    df_plot = df.copy()
+    df_plot["t_hours"] = (df_plot[time_col] - FAST_START).dt.total_seconds() / 3600.0
+    plt.figure(figsize=(10, 4))
+    plt.scatter(df_plot["t_hours"], df_plot[temp_col], s=5, alpha=0.7)
+    plt.axvline(0.0, color="red", linestyle="--", label="fast start")
+    plt.axhline(THRESHOLD, color="orange", linestyle="--",
+                label=f"threshold {THRESHOLD}°C")
+    plt.xlabel("Hours since fast start")
+    plt.ylabel("Surface temperature (°C)")
+    plt.title("N15: temperature around fasting (with torpor)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    bout = detect_main_torpor_bout(df, time_col, temp_col)
+    t_bout = bout["t_hours"].values
+    T_bout = bout[temp_col].values
+
+    i_min = np.argmin(T_bout)
+    t_min = t_bout[i_min]
+    T_min = T_bout[i_min]
+
+    t_cool = t_bout[:i_min + 1]
+    T_cool = T_bout[:i_min + 1]
+    t_c0 = t_cool[0]
+    t_cool_rel = t_cool - t_c0
+
+    cool_params = fit_exp_cooling(t_cool_rel, T_cool)
+    tau_cool = cool_params["tau"]
+    Tinf_cool = cool_params["T_inf"]
+
+    t_warm = t_bout[i_min:]
+    T_warm = T_bout[i_min:]
+    t_w0 = t_warm[0]
+    t_warm_rel = t_warm - t_w0
+
+    warm_params = fit_exp_warming(t_warm_rel, T_warm)
+    tau_warm = warm_params["tau"]
+    Tinf_warm = warm_params["T_inf"]
+
+    print("\n=== N15 torpor exponential fit (rough) ===")
+    print(f"Cooling phase: start t = {t_c0:.2f} h, "
+          f"T_inf ≈ {Tinf_cool:.2f} °C, tau_cool ≈ {tau_cool:.2f} h")
+    print(f"Warming phase: start t = {t_w0:.2f} h, "
+          f"T_inf ≈ {Tinf_warm:.2f} °C, tau_warm ≈ {tau_warm:.2f} h")
+    print(f"Minimum temperature T_min ≈ {T_min:.2f} °C at t ≈ {t_min:.2f} h")
+
+    t_cool_fine = np.linspace(t_cool_rel.min(), t_cool_rel.max(), 200)
+    T_cool_fit = Tinf_cool + (T_cool[0] - Tinf_cool) * np.exp(-t_cool_fine / tau_cool)
+
+    t_warm_fine = np.linspace(t_warm_rel.min(), t_warm_rel.max(), 200)
+    T_warm_fit = Tinf_warm - (Tinf_warm - T_min) * np.exp(-t_warm_fine / tau_warm)
+
+    plt.figure(figsize=(8, 4))
+    plt.scatter(t_bout, T_bout, s=10, alpha=0.6, label="torpor data")
+
+    plt.plot(t_c0 + t_cool_fine, T_cool_fit,
+             color="blue", label="cooling fit")
+    plt.plot(t_w0 + t_warm_fine, T_warm_fit,
+             color="orange", label="warming fit")
+
+    plt.xlabel("Hours since fast start")
+    plt.ylabel("Surface temperature (°C)")
+    plt.title("N15: torpor cooling/warming exponential fit")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
