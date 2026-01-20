@@ -1,2 +1,25 @@
 data_processing.ipynb:
+1. Natural torpor loading and cleaning
+2. Synthetic torpor
+· For each mouse (one sheet per RFID):
+Extracts baseline period (first 24 h) and CNO (synthetic torpor) period (next 24 h)
+3. Natural vs synthetic comparison: Combines natural table 'df_nat' and synthetic table 'df_syn'
 
+FFt.py:
+frequency-domain analysis into reusable functions
+· Load a temperature time series for a given mouse and window
+· Compute residuals and FFT
+
+Temperature threshold:
+Records the temperature-only threshold for torpor
+· Uses all natural torpor mice (N9, N10, N11, N12, N14, N15, N16)
+· Compares baseline temperature distributions to torpor bouts
+· Derives a cut-off around 34°C
+
+N15: temperature without torpor:
+About N15 baseline (no torpor) daily curve
+· Takes a long baseline segment for N15 (days with no torpor influence)
+· Fits a 24-h sinusoid
+Plots: Hourly mean temperature vs time-of-day
+
+N15: temperature with torpor
