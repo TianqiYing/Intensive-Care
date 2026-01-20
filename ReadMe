@@ -22,4 +22,23 @@ About N15 baseline (no torpor) daily curve
 · Fits a 24-h sinusoid
 Plots: Hourly mean temperature vs time-of-day
 
-N15: temperature with torpor
+N15: temperature with torpor：
+1. Global view plot
+· Baseline daily oscillations above ~36–38°C
+· Deep torpor drop to ~24°C after fasting
+· Recovery to baseline levels
+2. Zoomed torpor bout with exponential fits
+Plots:
+· Blue dots: real data
+· Blue/orange curves: exponential fits
+
+SVM: where it turns all the physiological features (temperature, Fourier index, activity) into an automatic classifier using Support Vector Machines
+Load a feature matrix (one row per mouse or per bout) with:
+· Fourier indices
+· Exponential cooling/warming parameters
+· Tmin, torpor duration
+
+Comparing parameters.py: a parameter comparison toolbox
+Plot:
+· Scatterplots between parameters: e.g. Tmin vs weight, etc.
+· Group comparisons: torpor vs non-torpor mice, male vs female, light vs heavy
