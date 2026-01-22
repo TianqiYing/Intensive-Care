@@ -1,0 +1,241 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import silhouette_score, classification_report
+
+import matplotlib.pyplot as plt
+
+
+FAST_START = pd.Timestamp("2023-09-05 12:00")
+
+
+def load_mouse_N(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, engine="openpyxl")
+    df = df.copy()
+    df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+    df = df.dropna(subset=["Time", "Temperature"]).sort_values("Time")
+    return df
+
+
+def fit_daily_sinusoid(df: pd.DataFrame):
+    tod = (
+        df["Time"].dt.hour
+        + df["Time"].dt.minute / 60
+        + df["Time"].dt.second / 3600
+    )
+    temp = df["Temperature"].astype(float).values
+    omega = 2 * np.pi / 24.0
+    t = tod.values
+    X = np.column_stack(
+        [np.ones_like(t), np.cos(omega * t), np.sin(omega * t)]
+    )
+    beta, *_ = np.linalg.lstsq(X, temp, rcond=None)
+    C0, A, B = beta
+    return C0, A, B
+
+
+def baseline_predict(C0, A, B, tod_hours):
+    omega = 2 * np.pi / 24.0
+    tod_hours = np.asarray(tod_hours)
+    return C0 + A * np.cos(omega * tod_hours) + B * np.sin(omega * tod_hours)
+
+
+def fourier_index_from_residuals(times, temps, C0, A, B, f_cut=1 / 12):
+    times = pd.to_datetime(times)
+    if len(times) < 10:
+        return np.nan
+
+    tod = (
+        times.dt.hour
+        + times.dt.minute / 60
+        + times.dt.second / 3600
+    )
+    Tobs = np.asarray(temps, dtype=float)
+    Tbase = baseline_predict(C0, A, B, tod.values)
+    resid = Tobs - Tbase
+
+    ts = pd.Series(resid, index=times)
+    ts = ts.resample("10min").mean().interpolate("time")
+    if len(ts) < 8:
+        return np.nan
+
+    y = ts.values - ts.values.mean()
+    t = (ts.index - ts.index[0]).total_seconds() / 3600.0
+    dt = np.median(np.diff(t))
+
+    freqs = np.fft.rfftfreq(len(y), d=dt)
+    fft_vals = np.fft.rfft(y)
+    power = np.abs(fft_vals) ** 2
+
+    mask_all = freqs > 0
+    mask_low = (freqs > 0) & (freqs <= f_cut)
+    if power[mask_all].sum() == 0:
+        return np.nan
+
+    return float(power[mask_low].sum() / power[mask_all].sum())
+
+
+def simple_torpor_features(times, temps, threshold=34.0):
+    times = pd.to_datetime(times)
+    temps = np.asarray(temps, dtype=float)
+    if len(temps) == 0:
+        return dict(T_min=np.nan, drop_amp=np.nan, dur_below_thr_h=np.nan)
+
+    T_min = float(np.nanmin(temps))
+    T_mean = float(np.nanmean(temps))
+    drop_amp = T_mean - T_min
+
+    below = temps < threshold
+    if below.any() and len(times) > 1:
+        dt_hours = (
+            np.median(
+                np.diff(times.values)
+                .astype("timedelta64[s]")
+                .astype(int)
+            )
+            / 3600.0
+        )
+        dur = below.sum() * dt_hours
+    else:
+        dur = 0.0
+
+    return dict(T_min=T_min, drop_amp=drop_amp, dur_below_thr_h=dur)
+
+
+def compute_features_for_mouse(mouse_name: str, root: Path):
+    path = root / f"{mouse_name}.xlsx"
+    df = load_mouse_N(path)
+
+    df_base = df[df["Time"] < FAST_START]
+    df_post = df[
+        (df["Time"] >= FAST_START)
+        & (df["Time"] <= FAST_START + pd.Timedelta(hours=24))
+    ]
+    if len(df_base) < 50 or len(df_post) < 50:
+        return None
+
+    C0, A, B = fit_daily_sinusoid(df_base)
+
+    # last 24 h of baseline
+    t_end = df_base["Time"].max()
+    t_start = t_end - pd.Timedelta(hours=24)
+    df_base24 = df_base[df_base["Time"].between(t_start, t_end)]
+
+    idx_base = fourier_index_from_residuals(
+        df_base24["Time"], df_base24["Temperature"], C0, A, B
+    )
+    idx_post = fourier_index_from_residuals(
+        df_post["Time"], df_post["Temperature"], C0, A, B
+    )
+
+    feat_base = simple_torpor_features(
+        df_base24["Time"], df_base24["Temperature"]
+    )
+    feat_post = simple_torpor_features(
+        df_post["Time"], df_post["Temperature"]
+    )
+
+    res = dict(
+        mouse=mouse_name,
+        group="natural",
+        C0=C0,
+        A=A,
+        B=B,
+        idx_base=idx_base,
+        idx_post=idx_post,
+    )
+    for k, v in feat_base.items():
+        res[f"base_{k}"] = v
+    for k, v in feat_post.items():
+        res[f"post_{k}"] = v
+
+    return res
+
+
+def main():
+    project_root = Path(__file__).resolve().parent
+
+    torpor_mice = ["N9", "N10", "N11", "N12", "N14", "N15", "N16"]
+    rows = []
+    for name in torpor_mice:
+        r = compute_features_for_mouse(name, project_root)
+        if r is not None:
+            rows.append(r)
+
+    df_nat = pd.DataFrame(rows)
+    print("Natural torpor feature table:")
+    print(df_nat)
+
+    # Optionally save to CSV for later use
+    df_nat.to_csv(project_root / "features_natural_torpor.csv", index=False)
+
+    feature_cols = [
+        "idx_post",
+        "post_T_min",
+        "post_drop_amp",
+        "post_dur_below_thr_h",
+    ]
+    X = df_nat[feature_cols].values
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    K = 2  # number of clusters
+    gmm = GaussianMixture(n_components=K, random_state=0)
+    cluster_labels = gmm.fit_predict(X_scaled)
+    sil = silhouette_score(X_scaled, cluster_labels)
+    print(f"Silhouette score for K={K}: {sil:.3f}")
+
+    df_nat["cluster_id"] = cluster_labels
+    print(df_nat[["mouse", "cluster_id"] + feature_cols])
+
+    X_clf = X_scaled
+    y_clf = cluster_labels
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_clf, y_clf, test_size=0.3, random_state=0, stratify=y_clf
+    )
+
+    svm = SVC(kernel="rbf", C=1.0, gamma="scale")
+    svm.fit(X_train, y_train)
+    y_pred = svm.predict(X_test)
+
+    print("SVM classification report (predicting GMM clusters):")
+    print(classification_report(y_test, y_pred))
+
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X_scaled)
+
+    plt.figure(figsize=(5, 4))
+    for cid, marker, color in [(0, "o", "C0"), (1, "s", "C1")]:
+        mask = cluster_labels == cid
+        plt.scatter(
+            X_pca[mask, 0],
+            X_pca[mask, 1],
+            marker=marker,
+            label=f"cluster {cid}",
+        )
+    for i, name in enumerate(df_nat["mouse"]):
+        plt.text(
+            X_pca[i, 0] + 0.02,
+            X_pca[i, 1] + 0.02,
+            name,
+            fontsize=8,
+        )
+
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title("Natural torpor mice: GMM clusters in feature space")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
