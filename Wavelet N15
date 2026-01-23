@@ -1,0 +1,123 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pywt
+
+# fasting start time
+FAST_START = pd.Timestamp("2023-09-05 12:00")
+
+
+def load_mouse_N(mouse_name: str, root: Path) -> pd.DataFrame:
+    path = root / f"{mouse_name}.xlsx"
+    df = pd.read_excel(path, engine="openpyxl")
+    df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+    df = df.dropna(subset=["Time", "Temperature"]).sort_values("Time")
+    return df
+
+
+def fit_daily_sinusoid(df: pd.DataFrame):
+    tod = (
+        df["Time"].dt.hour
+        + df["Time"].dt.minute / 60
+        + df["Time"].dt.second / 3600
+    )
+    temp = df["Temperature"].astype(float).values
+
+    omega = 2 * np.pi / 24.0
+    t = tod.values
+    X = np.column_stack(
+        [np.ones_like(t), np.cos(omega * t), np.sin(omega * t)]
+    )
+    beta, *_ = np.linalg.lstsq(X, temp, rcond=None)
+    C0, A, B = beta
+    return C0, A, B
+
+
+def baseline_predict(C0, A, B, tod_hours):
+    omega = 2 * np.pi / 24.0
+    tod_hours = np.asarray(tod_hours)
+    return C0 + A * np.cos(omega * tod_hours) + B * np.sin(omega * tod_hours)
+
+
+def compute_residual_post_fast_N15(project_root: Path):
+    df15 = load_mouse_N("N15", project_root)
+
+    # 1) split baseline and post-fast 0–24h
+    df_base = df15[df15["Time"] < FAST_START]
+    df_post = df15[
+        (df15["Time"] >= FAST_START)
+        & (df15["Time"] <= FAST_START + pd.Timedelta(hours=24))
+    ]
+
+    # 2) fit 24h sinusoid on baseline
+    C0, A, B = fit_daily_sinusoid(df_base)
+
+    # 3) compute residuals in post-fast window
+    tod_post = (
+        df_post["Time"].dt.hour
+        + df_post["Time"].dt.minute / 60
+        + df_post["Time"].dt.second / 3600
+    )
+    Tobs = df_post["Temperature"].astype(float).values
+    Tbase = baseline_predict(C0, A, B, tod_post.values)
+    resid = Tobs - Tbase  # obs - baseline
+
+    # 4) resample residuals to 10-min grid
+    ts = pd.Series(resid, index=df_post["Time"])
+    ts = ts.resample("10min").mean().interpolate("time")
+
+    y = ts.values
+    t_hours = (ts.index - ts.index[0]).total_seconds() / 3600.0
+
+    return t_hours, y
+
+
+def wavelet_analysis_N15(project_root: Path):
+    # get residual time series
+    t_hours, y = compute_residual_post_fast_N15(project_root)
+
+    # sampling interval (hours)
+    dt = np.median(np.diff(t_hours))
+
+    # choose periods (in hours)
+    periods = np.linspace(0.5, 24.0, 60)
+    # approximate scale for Morlet: scale ~ period / dt
+    scales = periods / dt
+
+    # continuous wavelet transform
+    coeffs, freqs = pywt.cwt(
+        y, scales, "morl", sampling_period=dt
+    )
+    power = np.abs(coeffs) ** 2  # power scalogram
+
+    plt.figure(figsize=(8, 3))
+    plt.plot(t_hours, y)
+    plt.axhline(0, linestyle="--", color="gray")
+    plt.xlabel("Hours since fast start")
+    plt.ylabel("Residual temp (°C)")
+    plt.title("N15 residual temperature (0–24h post fasting)")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    extent = [t_hours[0], t_hours[-1], periods[0], periods[-1]]
+    plt.imshow(
+        power,
+        extent=extent,
+        aspect="auto",
+        origin="lower",
+    )
+    plt.xlabel("Hours since fast start")
+    plt.ylabel("Period (hours)")
+    plt.title("N15 wavelet power scalogram (Morlet)")
+    plt.colorbar(label="Power")
+    plt.tight_layout()
+    plt.show()
+
+    return t_hours, periods, power
+
+
+if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parent
+    t_hours, periods, power = wavelet_analysis_N15(project_root)
