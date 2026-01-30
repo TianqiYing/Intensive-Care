@@ -2,279 +2,286 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
 
-FAST_START = pd.Timestamp("2023-09-05 12:00")
+
+DATE_FILES = {
+    "2023-10-22": "22Oct2023.xlsx",
+    "2023-10-28": "28Oct2023.xlsx",
+    "2023-11-04": "4Nov2023.xlsx",
+    "2023-11-18": "18Nov2023.xlsx",
+}
 
 
-def load_mouse_N(mouse_name: str, root: Path) -> pd.DataFrame:
-    path = root / f"{mouse_name}.xlsx"
-    df = pd.read_excel(path, engine="openpyxl")
-    df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
-    df = df.dropna(subset=["Time", "Temperature"]).sort_values("Time")
+def load_day_long(path: Path, date_str: str) -> pd.DataFrame:
+    # Header row may start at row 3 (index 2) as in previous scripts
+    df = pd.read_excel(path, sheet_name=0, header=2, engine="openpyxl")
+
+    records = []
+    for i in range(1, 7):
+        t_col = f"F{i}gpa.Temperature"
+        hr_col = f"F{i}gpa.Heart Rate"
+        act_col = f"F{i}gpa.Activity"
+        if t_col not in df.columns:
+            continue
+
+        sub = df[["Time Stamp", t_col, hr_col, act_col]].copy()
+        sub.columns = ["Time", "Temperature", "HeartRate", "Activity"]
+
+        sub["Time"] = pd.to_datetime(sub["Time"])
+        sub["Temperature"] = pd.to_numeric(sub["Temperature"], errors="coerce")
+        sub["HeartRate"] = pd.to_numeric(sub["HeartRate"], errors="coerce")
+        sub["Activity"] = pd.to_numeric(sub["Activity"], errors="coerce")
+        sub = sub.dropna(subset=["Temperature", "HeartRate", "Activity"])
+
+        sub["mouse"] = f"F{i}"
+        sub["date_str"] = date_str
+        records.append(sub)
+
+    out = pd.concat(records, ignore_index=True)
+    return out
+
+
+def load_all_days(root: Path) -> pd.DataFrame:
+    dfs = []
+    for date_str, fname in DATE_FILES.items():
+        df_day = load_day_long(root / fname, date_str)
+        dfs.append(df_day)
+    df_all = pd.concat(dfs, ignore_index=True)
+    return df_all
+
+
+def build_point_features_raw(df_all: pd.DataFrame) -> pd.DataFrame:
+    feat_list = []
+
+    for (mouse, date_str), sub in df_all.groupby(["mouse", "date_str"]):
+        sub = sub.sort_values("Time").reset_index(drop=True)
+
+        # basic numeric signals
+        temp = pd.to_numeric(sub["Temperature"], errors="coerce").values.astype(float)
+        hr   = pd.to_numeric(sub["HeartRate"],   errors="coerce").values.astype(float)
+        act  = pd.to_numeric(sub["Activity"],    errors="coerce").values.astype(float)
+
+        # time in seconds
+        t_sec = sub["Time"].values.astype("datetime64[ns]").astype("int64") / 1e9
+
+        n = len(sub)
+
+        dT_dt = np.full(n, np.nan, dtype=float)
+        if n > 1:
+            dt_sec   = t_sec[1:] - t_sec[:-1]
+            dt_hours = dt_sec / 3600.0
+            for i in range(1, n):
+                if dt_hours[i - 1] > 0:
+                    dT_dt[i] = (temp[i] - temp[i - 1]) / dt_hours[i - 1]
+                # else keep NaN
+
+        # use local "day start" (00:00 of that date) as phase reference
+        day_start = pd.to_datetime(sub["Time"].iloc[0]).normalize()
+        t_hours = (sub["Time"] - day_start).dt.total_seconds() / 3600.0  # 0..24+
+
+        period = 24.0
+        phi = 2.0 * np.pi * t_hours / period
+
+        cos_t1 = np.cos(phi)
+        sin_t1 = np.sin(phi)
+        cos_t2 = np.cos(2.0 * phi)
+        sin_t2 = np.sin(2.0 * phi)
+
+        feats = pd.DataFrame(
+            {
+                "Time":      sub["Time"],
+                "temp_raw":  temp,
+                "hr_raw":    hr,
+                "act_raw":   act,
+                "logAct_raw": np.log1p(act),
+                "dT_dt":     dT_dt,
+                # Fourier time features
+                "t_hours":   t_hours,
+                "cos_t1":    cos_t1,
+                "sin_t1":    sin_t1,
+                "cos_t2":    cos_t2,
+                "sin_t2":    sin_t2,
+                # identifiers
+                "mouse":     mouse,
+                "date_str":  date_str,
+            }
+        )
+
+        feat_list.append(feats)
+
+    feats_all = pd.concat(feat_list, ignore_index=True)
+    return feats_all
+
+
+def gmm_cluster_points(
+    feats: pd.DataFrame,
+    n_components_min: int = 4,
+    n_components_max: int = 6,
+):
+    feature_cols = [
+        "temp_raw",
+        "hr_raw",
+        "logAct_raw",
+        "dT_dt",
+        "cos_t1",
+        "sin_t1",
+        "cos_t2",
+        "sin_t2",
+    ]
+
+    feats_clean = feats.copy()
+
+    # ensure all feature columns are numeric
+    for col in feature_cols:
+        feats_clean[col] = pd.to_numeric(feats_clean[col], errors="coerce")
+
+    # keep only rows where all features are finite
+    mask_finite = np.isfinite(feats_clean[feature_cols]).all(axis=1)
+    feats_clean = feats_clean[mask_finite].dropna(subset=feature_cols)
+
+    print("Number of points used for GMM:", len(feats_clean))
+
+    X = feats_clean[feature_cols].values
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    best_gmm = None
+    best_k = None
+    best_bic = np.inf
+
+    for k in range(n_components_min, n_components_max + 1):
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type="full",
+            random_state=0,
+        )
+        gmm.fit(X_scaled)
+        bic = gmm.bic(X_scaled)
+        print(f"GMM K={k}, BIC={bic:.2f}")
+        if bic < best_bic:
+            best_bic = bic
+            best_k = k
+            best_gmm = gmm
+
+    print(f"\nSelected K={best_k} with lowest BIC={best_bic:.2f}")
+
+    labels = best_gmm.predict(X_scaled)
+    feats_clean["cluster"] = labels
+
+    # merge cluster labels back to the full feature table
+    feats_out = feats.merge(
+        feats_clean[["mouse", "date_str", "Time", "cluster"]],
+        on=["mouse", "date_str", "Time"],
+        how="left",
+    )
+
+    # quick numeric summary to understand what each cluster looks like
+    summary = []
+    for c in range(best_k):
+        sub = feats_out[feats_out["cluster"] == c]
+        if len(sub) == 0:
+            continue
+        summary.append(
+            dict(
+                cluster=c,
+                n=len(sub),
+                mean_T=sub["temp_raw"].mean(),
+                mean_HR=sub["hr_raw"].mean(),
+                mean_Act=sub["act_raw"].mean(),
+                mean_dT=sub["dT_dt"].mean(),
+            )
+        )
+
+    summary_df = pd.DataFrame(summary).sort_values("mean_T")
+    print("\nGMM cluster summary (sorted by mean_T):")
+    print(summary_df)
+
+    return feats_out, summary_df, scaler, best_gmm, best_k
+
+
+def attach_cluster_to_raw(df_all: pd.DataFrame, feats_points: pd.DataFrame) -> pd.DataFrame:
+    df = df_all.copy()
+    df = df.merge(
+        feats_points[["mouse", "date_str", "Time", "cluster"]],
+        on=["mouse", "date_str", "Time"],
+        how="left",
+    )
     return df
 
 
-def build_empirical_baseline(df_base: pd.DataFrame) -> pd.Series:
-    tod_hours = (
-        df_base["Time"].dt.hour
-        + df_base["Time"].dt.minute / 60
-        + df_base["Time"].dt.second / 3600
-    )
-    df_tmp = df_base.copy()
-    df_tmp["tod"] = tod_hours
-    df_tmp["hour"] = df_tmp["tod"].astype(int)  # 0..23
+def plot_mouse_day_clusters(df_clustered: pd.DataFrame, mouse: str, date_str: str):
+    df = df_clustered[
+        (df_clustered["mouse"] == mouse) & (df_clustered["date_str"] == date_str)
+    ].copy()
+    if df.empty:
+        print(f"No data for {mouse} on {date_str}")
+        return
 
-    hourly_mean = df_tmp.groupby("hour")["Temperature"].mean()
-    hourly_mean = hourly_mean.reindex(range(24)).interpolate().bfill().ffill()
-    return hourly_mean  # index 0..23
+    df = df.sort_values("Time")
+    t_hours = (df["Time"] - df["Time"].iloc[0]).dt.total_seconds().values / 3600.0
 
+    plt.figure(figsize=(10, 3))
+    cmap = plt.get_cmap("tab10")
+    clusters = sorted(df["cluster"].dropna().unique())
 
-def eval_baseline_from_hourly(hour_float, hourly_mean: pd.Series):
-    h = np.asarray(hour_float)
-    h_floor = np.floor(h).astype(int) % 24
-    h_ceil = (h_floor + 1) % 24
-    frac = h - np.floor(h)
-    vals = hourly_mean.values
-    T0 = vals[h_floor]
-    T1 = vals[h_ceil]
-    return (1.0 - frac) * T0 + frac * T1
-
-
-def compute_residual_post_fast(
-    mouse_name: str,
-    project_root: Path,
-    window_hours: float = 24.0,
-):
-    df = load_mouse_N(mouse_name, project_root)
-
-    df_base = df[df["Time"] < FAST_START]
-    df_post = df[
-        (df["Time"] >= FAST_START)
-        & (df["Time"] <= FAST_START + pd.Timedelta(hours=window_hours))
-    ]
-    if df_base.empty or df_post.empty:
-        raise ValueError(f"{mouse_name}: baseline or post-fast window is empty.")
-
-    hourly_mean = build_empirical_baseline(df_base)
-
-    tod_post = (
-        df_post["Time"].dt.hour
-        + df_post["Time"].dt.minute / 60
-        + df_post["Time"].dt.second / 3600
-    )
-    Tobs = df_post["Temperature"].astype(float).values
-    Tbase = eval_baseline_from_hourly(tod_post.values, hourly_mean)
-    resid_raw = Tobs - Tbase
-
-    # resample to regular 10-min intervals
-    ts = pd.Series(resid_raw, index=df_post["Time"])
-    ts = ts.resample("10min").mean().interpolate("time")
-
-    resid = ts.values
-    t_hours = (ts.index - ts.index[0]).total_seconds() / 3600.0
-
-    return ts.index, t_hours, resid
-    # return both timestamps and hour-since-fast-start
-
-
-def classify_torpor_phases(
-    t_hours,
-    resid,
-    thr_entry=-1.5,
-    thr_deep=-6.0,
-    thr_exit=-1.5,
-    smooth_win=5,
-):
-    r = resid.copy()
-
-    # Smooth residual with moving average to reduce noise
-    if smooth_win > 1:
-        kernel = np.ones(smooth_win) / smooth_win
-        r_smooth = np.convolve(r, kernel, mode="same")
-    else:
-        r_smooth = r
-
-    # Approximate d(resid)/dt (°C per hour)
-    dt = np.median(np.diff(t_hours))
-    drdt = np.gradient(r_smooth, dt)
-
-    n = len(r_smooth)
-
-    idx_entry_candidates = np.where(r_smooth < thr_entry)[0]
-    if len(idx_entry_candidates) == 0:
-        idx_entry = 0
-    else:
-        idx_entry = idx_entry_candidates[0]
-
-    idx_deep_candidates = np.where(r_smooth < thr_deep)[0]
-    if len(idx_deep_candidates) == 0:
-        idx_deep_start = idx_entry
-    else:
-        idx_deep_start = idx_deep_candidates[0]
-
-    idx_min = np.argmin(r_smooth)
-
-    idx_rewarm_candidates = np.where(
-        (np.arange(n) > idx_min) & (drdt > 0.3)
-    )[0]
-    if len(idx_rewarm_candidates) == 0:
-        idx_rewarm_start = idx_min
-    else:
-        idx_rewarm_start = idx_rewarm_candidates[0]
-
-    idx_recovered_candidates = np.where(
-        (np.arange(n) > idx_rewarm_start) & (r_smooth > thr_exit)
-    )[0]
-    if len(idx_recovered_candidates) == 0:
-        idx_recovered = n - 1
-    else:
-        idx_recovered = idx_recovered_candidates[0]
-
-    # enforce monotonic order
-    idx_entry = max(0, min(idx_entry, n - 1))
-    idx_deep_start = max(idx_entry, min(idx_deep_start, n - 1))
-    idx_min = max(idx_deep_start, min(idx_min, n - 1))
-    idx_rewarm_start = max(idx_min, min(idx_rewarm_start, n - 1))
-    idx_recovered = max(idx_rewarm_start, min(idx_recovered, n - 1))
-
-    # assign phase labels
-    labels = np.zeros(n, dtype=int)
-    labels[:idx_entry] = 0                       # baseline_before
-    labels[idx_entry:idx_deep_start] = 1         # entering_torpor
-    labels[idx_deep_start:idx_rewarm_start] = 2  # deep_torpor_plateau
-    labels[idx_rewarm_start:idx_recovered] = 3   # exiting_torpor
-    labels[idx_recovered:] = 4                   # baseline_after
-
-    cut_times = dict(
-        t_entry=t_hours[idx_entry],
-        t_deep_start=t_hours[idx_deep_start],
-        t_min=t_hours[idx_min],
-        t_rewarm_start=t_hours[idx_rewarm_start],
-        t_recovered=t_hours[idx_recovered],
-    )
-
-    return labels, cut_times
-
-
-PHASE_NAMES = {
-    0: "baseline_before",
-    1: "entering_torpor",
-    2: "deep_torpor_plateau",
-    3: "exiting_torpor",
-    4: "baseline_after",
-}
-
-PHASE_COLORS = {
-    0: "tab:green",
-    1: "tab:orange",
-    2: "tab:red",
-    3: "tab:purple",
-    4: "tab:blue",
-}
-
-
-def plot_phases(mouse_name, t_hours, resid, labels, cut_times):
-    plt.figure(figsize=(9, 3))
-    for ph in range(5):
-        mask = labels == ph
+    for c in clusters:
+        mask = df["cluster"] == c
         plt.scatter(
             t_hours[mask],
-            resid[mask],
-            s=14,
-            label=f"{ph}: {PHASE_NAMES[ph]}",
-            color=PHASE_COLORS[ph],
-        )
-    plt.axhline(0, linestyle="--", color="gray")
-
-    # vertical lines at phase boundaries
-    for key, t in cut_times.items():
-        plt.axvline(t, linestyle=":", color="gray", alpha=0.5)
-        plt.text(
-            t,
-            np.min(resid) - 0.5,
-            key,
-            rotation=90,
-            va="bottom",
-            ha="right",
-            fontsize=8,
+            df["Temperature"][mask],
+            s=8,
+            color=cmap(int(c)),
+            label=f"cluster {int(c)}",
+            alpha=0.8,
         )
 
-    plt.xlabel("Hours since fast start")
-    plt.ylabel("Residual temperature (°C)")
-    plt.title(f"{mouse_name}: 5 physiological phases")
-    plt.legend(loc="lower right", fontsize=8)
+    plt.xlabel("Hours since day start")
+    plt.ylabel("Temperature (°C)")
+    plt.title(f"{mouse} on {date_str} (GMM point clusters)")
+    plt.legend(fontsize=8, ncol=3)
     plt.tight_layout()
     plt.show()
 
 
-def summarize_phase_durations(mouse_name, t_hours, labels):
-    """
-    Print approximate duration (in hours) of each phase for a mouse.
-    """
-    dt = np.median(np.diff(t_hours))
-    print(f"\n=== {mouse_name}: phase durations (approx.) ===")
-    for ph in range(5):
-        n_points = np.sum(labels == ph)
-        duration_h = n_points * dt
-        print(f"  Phase {ph} ({PHASE_NAMES[ph]}): {duration_h:.2f} h")
-
-
 def main():
     root = Path(__file__).resolve().parent
-    mice = ["N9", "N10", "N12", "N14", "N15", "N16"]
 
-    all_summaries = []
+    # 1) load raw tables from four days
+    df_all = load_all_days(root)
+    print("All raw data shape:", df_all.shape)
 
-    for mouse_name in mice:
-        print(f"\n\n----- Processing {mouse_name} -----")
-        time_index, t_hours, resid = compute_residual_post_fast(
-            mouse_name, root, window_hours=24.0
-        )
+    # 2) build point-level features
+    feats_points = build_point_features_raw(df_all)
+    print("Point feature shape:", feats_points.shape)
 
-        labels, cut_times = classify_torpor_phases(
-            t_hours,
-            resid,
-            thr_entry=-1.5,   # same thresholds for all mice
-            thr_deep=-6.0,
-            thr_exit=-1.5,
-            smooth_win=5,
-        )
+    # 3) GMM clustering on feature space
+    feats_clustered, summary_df, scaler, gmm, K = gmm_cluster_points(
+        feats_points, n_components_min=4, n_components_max=6
+    )
 
-        print("Phase boundaries (hours since fast start):")
-        for k, v in cut_times.items():
-            print(f"  {k}: {v:.2f} h")
+    print("\nGMM cluster summary (sorted by mean_T):")
+    print(summary_df)
 
-        summarize_phase_durations(mouse_name, t_hours, labels)
+    # 4) map cluster back to original time series
+    df_clustered = attach_cluster_to_raw(df_all, feats_clustered)
 
-        # Save per-timepoint labels to CSV
-        df_out = pd.DataFrame(
-            {
-                "Time": time_index,
-                "hours_since_fast_start": t_hours,
-                "residual_temp": resid,
-                "phase": labels,
-            }
-        )
-        out_path = root / f"torpor_phases_{mouse_name}.csv"
-        df_out.to_csv(out_path, index=False)
-        print(f"Saved phase labels to {out_path.name}")
+    # 5) plot some key examples
+    examples = [
+        ("F4", "2023-10-22"),  # CR day with torpor
+        ("F3", "2023-10-28"),  # CR day with torpor
+        ("F1", "2023-11-18"),  # CR day with torpor
+        ("F2", "2023-11-04"),  # full-fed baseline
+    ]
+    for mouse, date_str in examples:
+        plot_mouse_day_clusters(df_clustered, mouse, date_str)
 
-        # keep summary row
-        dt = np.median(np.diff(t_hours))
-        summary_row = {"mouse": mouse_name}
-        for ph in range(5):
-            n_points = np.sum(labels == ph)
-            summary_row[f"phase{ph}_duration_h"] = n_points * dt
-        all_summaries.append(summary_row)
-
-        # plot for each mouse
-        plot_phases(mouse_name, t_hours, resid, labels, cut_times)
-
-    # Save summary table for all mice
-    df_summary = pd.DataFrame(all_summaries)
-    summary_path = root / "torpor_phase_durations_all_mice.csv"
-    df_summary.to_csv(summary_path, index=False)
-    print(f"\nSaved phase duration summary to {summary_path.name}")
+    # 6) save clustered raw data
+    out_path = root / f"F1F6_GMM_point_clusters_K{K}.csv"
+    df_clustered.to_csv(out_path, index=False)
+    print(f"\nClustered raw data saved to: {out_path}")
 
 
 if __name__ == "__main__":
