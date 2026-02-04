@@ -1,0 +1,216 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+import umap  # pip install umap-learn
+
+
+def load_mouse_time_temp(xlsx_path):
+    df = pd.read_excel(xlsx_path)
+
+    col_names = [c for c in df.columns if isinstance(c, str)]
+
+    time_cols = [c for c in col_names if 'time' in c.lower()]
+    if not time_cols:
+        raise RuntimeError(
+            f"[load_mouse_time_temp] {os.path.basename(xlsx_path)} 中找不到包含 'time' 的列"
+        )
+    time_col = time_cols[0]
+
+    temp_cols = [c for c in col_names
+                 if ('temp' in c.lower()) or ('surface' in c.lower())]
+    if not temp_cols:
+        raise RuntimeError(
+            f"[load_mouse_time_temp] {os.path.basename(xlsx_path)} 中找不到包含 'temp' 或 'surface' 的列"
+        )
+    temp_col = temp_cols[0]
+
+    t_raw = pd.to_datetime(df[time_col], errors='coerce')
+    if t_raw.isna().all():
+        raise RuntimeError(
+            f"The time column of [load_mouse_time_temp] {os.path.basename(xlsx_path)} cannot be parsed as datetime."
+        )
+
+    t_hours = (t_raw - t_raw.iloc[0]).dt.total_seconds() / 3600.0
+
+    temp = pd.to_numeric(df[temp_col], errors='coerce')
+
+    mask = (~t_hours.isna()) & (~temp.isna())
+    t = t_hours[mask].to_numpy()
+    T = temp[mask].to_numpy()
+
+    if len(t) < 3:
+        raise RuntimeError(
+            f"There are too few valid data points in [load_mouse_time_temp] {os.path.basename(xlsx_path)}"
+        )
+    dt = np.diff(t)
+    keep = np.insert(dt > 0, 0, True)
+    t = t[keep]
+    T = T[keep]
+
+    return t, T
+
+
+def compute_dT_dt(t, T):
+    t = np.asarray(t)
+    T = np.asarray(T)
+
+    dt = np.diff(t)
+    dT = np.diff(T)
+
+    dt_safe = dt.copy()
+    dt_safe[dt_safe == 0] = np.nan
+
+    dTdt = np.empty_like(T)
+    dTdt[1:] = dT / dt_safe
+    dTdt[0] = dTdt[1]
+
+    nan_mask = np.isnan(dTdt)
+    if nan_mask.any():
+        dTdt[nan_mask] = np.interp(t[nan_mask], t[~nan_mask], dTdt[~nan_mask])
+
+    return dTdt
+
+
+def collect_all_mice(data_dir, mouse_ids):
+    all_feats = []
+    all_t = []
+    all_T = []
+    all_mouse = []
+
+    for mid in mouse_ids:
+        fname = f"N{mid}.xlsx"
+        path = os.path.join(data_dir, fname)
+        if not os.path.exists(path):
+            continue
+
+        t, T = load_mouse_time_temp(path)
+        dTdt = compute_dT_dt(t, T)
+
+        t_day = np.mod(t, 24.0)
+
+        dTdt_trans = np.sign(dTdt) * np.log1p(np.abs(dTdt))
+
+        feats = np.column_stack([t_day, T, dTdt_trans])
+        all_feats.append(feats)
+        all_t.append(t)
+        all_T.append(T)
+        all_mouse.append(np.full_like(t, mid, dtype=int))
+
+    if not all_feats:
+        raise RuntimeError("No data was read from N1–N16")
+
+    X = np.vstack(all_feats)
+    t_all = np.concatenate(all_t)
+    T_all = np.concatenate(all_T)
+    mouse_all = np.concatenate(all_mouse)
+
+    return X, t_all, T_all, mouse_all
+
+
+def run_clustering_and_plot():
+    data_dir = os.path.dirname(os.path.abspath(__file__))
+    mouse_ids = list(range(1, 17))  # N1 … N16
+
+    X_raw, t_all, T_all, mouse_all = collect_all_mice(data_dir, mouse_ids)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw)
+
+    n_samples = X_scaled.shape[0]
+    max_fit_samples = 50000
+    if n_samples > max_fit_samples:
+        rng = np.random.default_rng(0)
+        idx_fit = rng.choice(n_samples, size=max_fit_samples, replace=False)
+    else:
+        idx_fit = np.arange(n_samples)
+
+    X_fit = X_scaled[idx_fit]
+
+    kmeans = KMeans(n_clusters=4, random_state=0, n_init=10)
+    km_labels = kmeans.fit_predict(X_fit)
+    km_centers = kmeans.cluster_centers_
+
+    gmm = GaussianMixture(
+        n_components=4,
+        covariance_type="full",
+        random_state=0,
+        reg_covar=1e-4,
+        init_params='kmeans',
+        means_init=km_centers
+    )
+    gmm.fit(X_fit)
+
+    labels = gmm.predict(X_scaled)
+
+    unique, counts = np.unique(labels, return_counts=True)
+    print("Cluster sizes:")
+    for u, c in zip(unique, counts):
+        print(f"  cluster {u}: {c} points")
+
+    reducer = umap.UMAP(
+        n_components=2,
+        random_state=0,
+        n_neighbors=50,
+        min_dist=0.1
+    )
+    embedding = reducer.fit_transform(X_scaled)
+
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+
+    plt.figure(figsize=(6, 5))
+    for k in range(4):
+        mask = labels == k
+        if not np.any(mask):
+            continue
+        plt.scatter(
+            embedding[mask, 0],
+            embedding[mask, 1],
+            s=2,
+            c=colors[k],
+            label=f"cluster {k}",
+            alpha=0.5
+        )
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.title("UMAP embedding of (t, T, dT/dt) with 4 GMM clusters")
+    plt.legend(markerscale=4)
+    plt.tight_layout()
+
+    target_mouse_id = 15  
+
+    sel = (mouse_all == target_mouse_id)
+    t_sel = t_all[sel]
+    T_sel = T_all[sel]
+    labels_sel = labels[sel]
+
+    plt.figure(figsize=(10, 4))
+    for k in range(4):
+        mask = (labels_sel == k)
+        if not np.any(mask):
+            continue
+        plt.scatter(
+            t_sel[mask],
+            T_sel[mask],
+            s=6,
+            c=colors[k],
+            label=f"cluster {k}",
+            alpha=0.8
+        )
+
+    plt.xlabel("Time since recording start (h)")
+    plt.ylabel("Temperature (°C)")
+    plt.title(f"Mouse N{target_mouse_id}: T(t) colored by 4 GMM clusters")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    run_clustering_and_plot()
