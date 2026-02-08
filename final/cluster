@@ -1,0 +1,613 @@
+# 01_cluster_pipeline.py
+# ------------------------------------------------------------
+# Supports .xlsx/.xls/.csv data
+# ------------------------------------------------------------
+
+import os
+import re
+import json
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score
+from sklearn.svm import SVC
+
+import matplotlib.pyplot as plt
+
+# ---- stability ----
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+
+def try_import_umap():
+    try:
+        import umap
+        return umap
+    except Exception:
+        return None
+
+
+def try_import_hmmlearn():
+    try:
+        from hmmlearn.hmm import GaussianHMM
+        return GaussianHMM
+    except Exception:
+        return None
+
+
+@dataclass
+class Config:
+    data_root: str = r"C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16"
+    out_dir: str = r"C:\Users\mayue\Desktop\Wavelet\out_cluster"
+
+    baseline_end_date: str = "2023-05-09"   # exclusive
+    startup_drop_hours: float = 2.0
+    resample_minutes: int = 5
+
+    slope_window_minutes: int = 30
+    delay_minutes: int = 15
+    embed_dim: int = 3
+    slope_clip: float = 5.0
+
+    n_clusters: int = 4
+    gmm_covariance_type: str = "full"
+    gmm_reg_covar: float = 1e-6
+    gmm_random_state: int = 0
+
+    do_hmm: bool = True
+    hmm_n_iter: int = 100
+    hmm_random_state: int = 0
+    hmm_covariance_type: str = "full"
+
+    do_umap: bool = True
+    umap_fit_n: int = 60000
+    umap_n_neighbors: int = 50
+    umap_min_dist: float = 0.10
+    umap_random_state: int = 0
+    umap_verbose: bool = True
+
+    do_svm_viz: bool = True
+    svm_C: float = 5.0
+    svm_gamma: str = "scale"
+
+    plot_mouse_id: int = 15
+    max_points_per_mouse_plot: int = 200000
+
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def save_json(obj: dict, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+# -------------------------
+# Column inference
+# -------------------------
+TIME_CANDIDATES = ["datetime", "time", "timestamp", "ts", "date", "DateTime", "Time", "Timestamp"]
+TEMP_CANDIDATES = ["Tb", "T", "temp", "temperature", "Temperature", "body_temp", "body_temperature"]
+
+
+def _pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
+    cols_l = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in cols_l:
+            return cols_l[cand.lower()]
+    # fallback: partial match
+    for c in cols:
+        cl = c.lower()
+        if any(k.lower() in cl for k in candidates):
+            return c
+    return None
+
+
+def _infer_mouse_id_from_path(path: str) -> Optional[int]:
+    base = os.path.basename(path)
+    m = re.search(r"(?:^|[^\d])N(\d{1,2})(?:[^\d]|$)", base, flags=re.IGNORECASE)
+    if m:
+        v = int(m.group(1))
+        return v if 1 <= v <= 99 else None
+    m = re.search(r"(?:^|[^\d])(\d{1,2})(?:[^\d]|$)", base)
+    if m:
+        v = int(m.group(1))
+        if 1 <= v <= 16:
+            return v
+    return None
+
+
+# -------------------------
+# File discovery
+# -------------------------
+def discover_data_files(data_root: str) -> List[str]:
+    exts = (".csv", ".xlsx", ".xls")
+    out = []
+    for root, _, files in os.walk(data_root):
+        for fn in files:
+            if fn.lower().endswith(exts):
+                out.append(os.path.join(root, fn))
+    return sorted(out)
+
+
+# -------------------------
+# Time parsing helpers
+# -------------------------
+def _parse_time_series(raw: pd.Series) -> pd.Series:
+    """
+    Robust time parsing:
+    - try pd.to_datetime directly
+    - if looks numeric, treat as Excel serial date (days since 1899-12-30)
+    """
+    ts = pd.to_datetime(raw, errors="coerce", utc=False)
+    if ts.notna().sum() >= max(10, int(0.2 * len(raw))):
+        return ts
+
+    # numeric fallback (Excel serial)
+    x = pd.to_numeric(raw, errors="coerce")
+    if x.notna().sum() == 0:
+        return ts  # all NaT
+    # Excel serial date: origin 1899-12-30
+    ts2 = pd.to_datetime(x, unit="D", origin="1899-12-30", errors="coerce")
+    return ts2
+
+
+def _read_excel_best_sheet(path: str) -> pd.DataFrame:
+    """
+    Read Excel and pick a sheet that contains time+temp columns.
+    Priority: first sheet that satisfies both, else first sheet.
+    """
+    xls = pd.ExcelFile(path)
+    sheets = xls.sheet_names
+
+    best_df = None
+    best_score = -1
+
+    for sh in sheets:
+        try:
+            df = pd.read_excel(path, sheet_name=sh)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+
+        tcol = _pick_col(df.columns.tolist(), TIME_CANDIDATES)
+        ycol = _pick_col(df.columns.tolist(), TEMP_CANDIDATES)
+        score = 0
+        score += 1 if tcol is not None else 0
+        score += 1 if ycol is not None else 0
+
+        if score > best_score:
+            best_score = score
+            best_df = df
+
+        if score == 2:
+            return df  # perfect
+
+    if best_df is None:
+        raise ValueError(f"Excel file has no readable sheets: {path}")
+    return best_df
+
+
+def load_mouse_timeseries(path: str) -> pd.DataFrame:
+    """
+    Return DataFrame with columns [timestamp, T]
+    """
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path)
+    else:
+        df = _read_excel_best_sheet(path)
+
+    tcol = _pick_col(df.columns.tolist(), TIME_CANDIDATES)
+    ycol = _pick_col(df.columns.tolist(), TEMP_CANDIDATES)
+    if tcol is None or ycol is None:
+        raise ValueError(f"Cannot infer time/temp columns in: {path}. cols={list(df.columns)[:30]}")
+
+    ts = _parse_time_series(df[tcol])
+    T = pd.to_numeric(df[ycol], errors="coerce")
+
+    out = pd.DataFrame({"timestamp": ts, "T": T})
+    out = out.dropna(subset=["timestamp", "T"]).sort_values("timestamp").reset_index(drop=True)
+    return out
+
+
+# -------------------------
+# Preprocess / features
+# -------------------------
+def resample_to_fixed_dt(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    dfi = df.set_index("timestamp").sort_index()
+    dfr = dfi.resample(f"{minutes}min").mean(numeric_only=True)
+    dfr["T"] = dfr["T"].ffill(limit=1)
+    dfr = dfr.dropna(subset=["T"]).reset_index()
+    return dfr
+
+
+def drop_startup(df: pd.DataFrame, hours: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    t0 = df["timestamp"].iloc[0]
+    return df[df["timestamp"] >= (t0 + pd.Timedelta(hours=hours))].reset_index(drop=True)
+
+
+def compute_baseline(df: pd.DataFrame, baseline_end_date: str) -> float:
+    end_ts = pd.to_datetime(baseline_end_date)
+    sub = df[df["timestamp"] < end_ts]
+    if len(sub) < 12:
+        if df.empty:
+            return float("nan")
+        t0 = df["timestamp"].iloc[0]
+        sub = df[df["timestamp"] < (t0 + pd.Timedelta(hours=24))]
+    return float(np.nanmedian(sub["T"].to_numpy()))
+
+
+def sign_log1p(x: np.ndarray, clip: float) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    x = np.clip(x, -clip, clip)
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def rolling_regression_slope(y: np.ndarray, dt_min: float, window_min: int) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    k = int(round(window_min / dt_min))
+    if k < 3:
+        raise ValueError("window too small after resampling.")
+    if n < k:
+        return np.full(n, np.nan)
+
+    r = np.arange(k, dtype=float)
+    t = r * dt_min
+    sum_t = float(t.sum())
+    sum_t2 = float((t * t).sum())
+    denom = k * sum_t2 - sum_t * sum_t
+    if denom <= 0:
+        return np.full(n, np.nan)
+
+    idx = np.arange(n, dtype=float)
+    cy = np.concatenate([[0.0], np.cumsum(y)])
+    ciy = np.concatenate([[0.0], np.cumsum(idx * y)])
+
+    b = np.full(n, np.nan)
+    for i in range(k - 1, n):
+        s = i - k + 1
+        sum_y = cy[i + 1] - cy[s]
+        sum_iy = ciy[i + 1] - ciy[s]
+        sum_ry = sum_iy - s * sum_y
+        sum_ty = dt_min * sum_ry
+        b[i] = (k * sum_ty - sum_t * sum_y) / denom  # °C/min
+    return b
+
+
+def build_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    dt_min = float(cfg.resample_minutes)
+    baseline = compute_baseline(df, cfg.baseline_end_date)
+
+    d = df.copy()
+    d["T_base"] = baseline
+    d["T_rel"] = d["T"] - baseline
+
+    slope_raw = rolling_regression_slope(d["T_rel"].to_numpy(), dt_min=dt_min, window_min=cfg.slope_window_minutes)
+    d["Slope_raw"] = slope_raw
+    d["Slope"] = sign_log1p(slope_raw, clip=cfg.slope_clip)
+
+    lag_steps = int(round(cfg.delay_minutes / dt_min))
+    if lag_steps < 1:
+        raise ValueError("delay_minutes must be >= resample_minutes.")
+    if cfg.embed_dim != 3:
+        raise ValueError("embed_dim must be 3 (as requested).")
+
+    d["T_rel_lag15"] = d["T_rel"].shift(lag_steps)
+    d["T_rel_lag30"] = d["T_rel"].shift(2 * lag_steps)
+
+    d = d.dropna(subset=["T_rel", "Slope", "T_rel_lag15", "T_rel_lag30"]).reset_index(drop=True)
+    return d
+
+
+# -------------------------
+# UMAP helper
+# -------------------------
+def umap_fit_transform(X: np.ndarray, cfg: Config) -> Optional[np.ndarray]:
+    umap = try_import_umap()
+    if umap is None:
+        print("[WARN] umap-learn not installed; skip UMAP.")
+        return None
+
+    n = X.shape[0]
+    fit_n = min(cfg.umap_fit_n, n)
+    rng = np.random.default_rng(cfg.umap_random_state)
+
+    if fit_n < n:
+        idx = rng.choice(n, size=fit_n, replace=False)
+        X_fit = X[idx]
+        print(f"[UMAP] fit on {fit_n:,} samples ...")
+    else:
+        X_fit = X
+        print(f"[UMAP] fit on all {n:,} samples ...")
+
+    reducer = umap.UMAP(
+        n_neighbors=cfg.umap_n_neighbors,
+        min_dist=cfg.umap_min_dist,
+        random_state=cfg.umap_random_state,
+        verbose=cfg.umap_verbose,
+    )
+
+    t0 = time.time()
+    reducer.fit(X_fit)
+    print(f"[UMAP] fit done in {time.time() - t0:.1f}s")
+
+    print(f"[UMAP] transform all {n:,} samples ...")
+    t1 = time.time()
+    emb = reducer.transform(X)
+    print(f"[UMAP] transform done in {time.time() - t1:.1f}s")
+    return emb
+
+
+# -------------------------
+# Plotting
+# -------------------------
+def plot_distributions(df_all: pd.DataFrame, label_col: str, out_path: str):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+    labs = sorted(df_all[label_col].dropna().unique().tolist())
+
+    for lab in labs:
+        sub = df_all[df_all[label_col] == lab]
+        axes[0].hist(sub["T_rel"], bins=120, alpha=0.35, label=f"c{lab}")
+        axes[1].hist(sub["Slope"], bins=120, alpha=0.35, label=f"c{lab}")
+        axes[2].hist(sub["t_hours_mod24"], bins=96, alpha=0.35, label=f"c{lab}")
+
+    axes[0].set_title("T_rel distribution"); axes[0].set_xlabel("T_rel (°C)"); axes[0].set_ylabel("Count")
+    axes[1].set_title("Slope distribution"); axes[1].set_xlabel("sign·log1p(|slope|)"); axes[1].set_ylabel("Count")
+    axes[2].set_title("Time-of-day (diagnostic, mod 24)"); axes[2].set_xlabel("Hours since recording start (mod 24)"); axes[2].set_ylabel("Count")
+
+    for ax in axes:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_mouse_timeseries(df_mouse: pd.DataFrame, label_col: str, out_path: str, cap: int):
+    d = df_mouse.copy()
+    if len(d) > cap:
+        d = d.iloc[:cap].copy()
+
+    fig = plt.figure(figsize=(16, 4))
+    plt.scatter(d["t_hours"], d["T"], s=10, c=d[label_col], alpha=0.85)
+    plt.title(f"Mouse N{int(d['mouse_id'].iloc[0])}: T(t) colored by {label_col}")
+    plt.xlabel("Time since recording start (h)")
+    plt.ylabel("Temperature (°C)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_umap(emb: np.ndarray, labels: np.ndarray, out_path: str, title: str):
+    fig = plt.figure(figsize=(6.5, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], s=4, c=labels, alpha=0.85)
+    plt.title(title)
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_svm_viz(emb: np.ndarray, y: np.ndarray, out_path: str, cfg: Config, title: str):
+    m = np.isfinite(emb).all(axis=1) & np.isfinite(y)
+    X2 = emb[m]
+    yy = y[m].astype(int)
+
+    svm = SVC(C=cfg.svm_C, gamma=cfg.svm_gamma, kernel="rbf")
+    svm.fit(X2, yy)
+    pred = svm.predict(X2)
+
+    fig = plt.figure(figsize=(6.5, 6))
+    plt.scatter(X2[:, 0], X2[:, 1], s=4, c=pred, alpha=0.85)
+    plt.title(title + " (SVM on UMAP)")
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    cfg = Config()
+    ensure_dir(cfg.out_dir)
+
+    files = discover_data_files(cfg.data_root)
+    if not files:
+        raise RuntimeError(f"No data files (.xlsx/.xls/.csv) found under: {cfg.data_root}")
+
+    mouse_to_path: Dict[int, str] = {}
+    for p in files:
+        mid = _infer_mouse_id_from_path(p)
+        if mid is None:
+            continue
+        mouse_to_path.setdefault(mid, p)
+
+    mice = sorted(mouse_to_path.keys())
+    if not mice:
+        raise RuntimeError(
+            "Could not infer mouse IDs from filenames.\n"
+            "Please ensure filenames contain N1..N16 like 'N15.xlsx'."
+        )
+
+    print(f"[OK] Found {len(mice)} mice: {mice}")
+
+    all_rows = []
+    summary_rows = []
+
+    for mid in mice:
+        path = mouse_to_path[mid]
+        try:
+            df0 = load_mouse_timeseries(path)
+        except Exception as e:
+            print(f"[SKIP] Mouse {mid} load failed: {e}")
+            continue
+
+        n_raw = len(df0)
+
+        df1 = drop_startup(df0, cfg.startup_drop_hours)
+        df2 = resample_to_fixed_dt(df1, cfg.resample_minutes)
+
+        baseline = compute_baseline(df2, cfg.baseline_end_date)
+        dfF = build_features(df2, cfg)
+        if dfF.empty:
+            print(f"[SKIP] Mouse {mid} empty after features.")
+            continue
+
+        t0 = df2["timestamp"].iloc[0]
+        dfF["mouse_id"] = mid
+        dfF["t_hours"] = (dfF["timestamp"] - t0).dt.total_seconds() / 3600.0
+        dfF["t_hours_mod24"] = np.mod(dfF["t_hours"].to_numpy(), 24.0)
+
+        summary_rows.append({
+            "mouse_id": mid,
+            "path": path,
+            "n_raw": n_raw,
+            "n_after_startup": len(df1),
+            "n_resampled": len(df2),
+            "n_features": len(dfF),
+            "baseline_median": baseline,
+        })
+
+        all_rows.append(dfF)
+
+    if not all_rows:
+        raise RuntimeError("No usable mice after preprocessing.")
+
+    df_all = pd.concat(all_rows, ignore_index=True)
+    df_summary = pd.DataFrame(summary_rows)
+
+    summary_path = os.path.join(cfg.out_dir, "data_summary.csv")
+    df_summary.to_csv(summary_path, index=False)
+    print(f"[SAVED] {summary_path}")
+
+    feat_cols = ["T_rel", "Slope", "T_rel_lag15", "T_rel_lag30"]
+    X = df_all[feat_cols].to_numpy(dtype=float)
+
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+
+    # ---- GMM ----
+    gmm = GaussianMixture(
+        n_components=cfg.n_clusters,
+        covariance_type=cfg.gmm_covariance_type,
+        reg_covar=cfg.gmm_reg_covar,
+        random_state=cfg.gmm_random_state,
+    )
+    label_gmm = gmm.fit_predict(Xz)
+    df_all["label_gmm"] = label_gmm
+
+    sil = None
+    try:
+        sil = float(silhouette_score(Xz, label_gmm))
+    except Exception:
+        pass
+
+    # ---- HMM (optional) ----
+    if cfg.do_hmm:
+        GaussianHMM = try_import_hmmlearn()
+        if GaussianHMM is None:
+            print("[WARN] hmmlearn not installed; skip HMM.")
+        else:
+            lengths = []
+            Xz_seq = []
+            for mid in sorted(df_all["mouse_id"].unique()):
+                sub = df_all[df_all["mouse_id"] == mid]
+                Xz_seq.append(scaler.transform(sub[feat_cols].to_numpy(dtype=float)))
+                lengths.append(len(sub))
+            Xz_cat = np.vstack(Xz_seq)
+
+            hmm = GaussianHMM(
+                n_components=cfg.n_clusters,
+                covariance_type=cfg.hmm_covariance_type,
+                n_iter=cfg.hmm_n_iter,
+                random_state=cfg.hmm_random_state,
+                verbose=False,
+            )
+            hmm.fit(Xz_cat, lengths=lengths)
+            df_all["label_hmm"] = hmm.predict(Xz_cat, lengths=lengths)
+
+    # ---- UMAP (optional) ----
+    emb = None
+    if cfg.do_umap:
+        emb = umap_fit_transform(Xz, cfg)
+        if emb is not None:
+            df_all["umap1"] = emb[:, 0]
+            df_all["umap2"] = emb[:, 1]
+
+    # ---- Save outputs ----
+    out_csv = os.path.join(cfg.out_dir, "clusters_all_samples.csv")
+    df_all.to_csv(out_csv, index=False)
+    print(f"[SAVED] {out_csv}")
+
+    out_cfg = os.path.join(cfg.out_dir, "config_cluster.json")
+    save_json({
+        "feature_cols": feat_cols,
+        "baseline_end_date": cfg.baseline_end_date,
+        "startup_drop_hours": cfg.startup_drop_hours,
+        "resample_minutes": cfg.resample_minutes,
+        "slope_window_minutes": cfg.slope_window_minutes,
+        "delay_minutes": cfg.delay_minutes,
+        "embed_dim": cfg.embed_dim,
+        "n_clusters": cfg.n_clusters,
+        "silhouette_gmm_on_Xz": sil,
+    }, out_cfg)
+    print(f"[SAVED] {out_cfg}")
+
+    # ---- Plots ----
+    plot_distributions(df_all, "label_gmm", os.path.join(cfg.out_dir, "dist__label_gmm.png"))
+    if "label_hmm" in df_all.columns:
+        plot_distributions(df_all, "label_hmm", os.path.join(cfg.out_dir, "dist__label_hmm.png"))
+
+    mid = cfg.plot_mouse_id
+    if mid in df_all["mouse_id"].unique():
+        d = df_all[df_all["mouse_id"] == mid].copy()
+        plot_mouse_timeseries(d, "label_gmm", os.path.join(cfg.out_dir, f"mouse_N{mid}__label_gmm.png"),
+                              cap=cfg.max_points_per_mouse_plot)
+        if "label_hmm" in df_all.columns:
+            plot_mouse_timeseries(d, "label_hmm", os.path.join(cfg.out_dir, f"mouse_N{mid}__label_hmm.png"),
+                                  cap=cfg.max_points_per_mouse_plot)
+
+    if emb is not None:
+        plot_umap(emb, df_all["label_gmm"].to_numpy(), os.path.join(cfg.out_dir, "umap_scatter__label_gmm.png"),
+                  "UMAP colored by label_gmm")
+        if cfg.do_svm_viz:
+            plot_svm_viz(emb, df_all["label_gmm"].to_numpy(), os.path.join(cfg.out_dir, "umap_svm__label_gmm.png"),
+                         cfg, "UMAP colored by label_gmm")
+
+        if "label_hmm" in df_all.columns:
+            plot_umap(emb, df_all["label_hmm"].to_numpy(), os.path.join(cfg.out_dir, "umap_scatter__label_hmm.png"),
+                      "UMAP colored by label_hmm")
+            if cfg.do_svm_viz:
+                plot_svm_viz(emb, df_all["label_hmm"].to_numpy(), os.path.join(cfg.out_dir, "umap_svm__label_hmm.png"),
+                             cfg, "UMAP colored by label_hmm")
+
+    # ---- Sizes ----
+    print("\nCluster sizes (label_gmm):")
+    for k in range(cfg.n_clusters):
+        print(f"  cluster {k}: {(df_all['label_gmm']==k).sum()}")
+
+    if "label_hmm" in df_all.columns:
+        print("\nCluster sizes (label_hmm):")
+        for k in range(cfg.n_clusters):
+            print(f"  cluster {k}: {(df_all['label_hmm']==k).sum()}")
+
+    print(f"\n[DONE] Outputs in: {cfg.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
