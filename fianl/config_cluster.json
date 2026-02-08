@@ -1,0 +1,27 @@
+{
+  "feature_cols": [
+    "T_rel",
+    "Slope",
+    "T_rel_lag15",
+    "T_rel_lag30"
+  ],
+  "resample_minutes": 5,
+  "drop_first_hours": 36.0,
+  "do_auto_coldstart": true,
+  "cold_start_rule": {
+    "cold_window_hours": 6.0,
+    "cold_require_hours": 12.0,
+    "cold_min_temp": 35.0,
+    "cold_max_std": 0.4,
+    "cold_max_hours_cap": 72.0
+  },
+  "baseline_end_date": "2023-09-05",
+  "baseline_quantile": 0.7,
+  "slope_window_minutes": 30,
+  "delay_minutes": 15,
+  "embed_dim": 3,
+  "n_clusters": 4,
+  "silhouette_gmm_on_Xz": 0.37417764597174463,
+  "per_mouse_window_start": "2023-09-03 00:00:00",
+  "dayfirst": true
+}

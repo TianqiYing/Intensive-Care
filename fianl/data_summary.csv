@@ -1,0 +1,17 @@
+mouse_id,path,n_raw,n_resampled,n_after_hard_drop,n_after_coldstart,n_features,hard_drop_hours,cold_start_dropped_hours,cold_start_reason,baseline_median_hiQ,dayfirst,cold_window_hours,cold_require_hours,cold_min_temp,cold_max_std
+1,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N1.xlsx,14317,8253,8140,8140,8134,36.0,0.0,no_stable_segment_found,37.28,True,,,,
+2,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N2.xlsx,15403,9269,9149,9149,9143,36.0,0.0,no_stable_segment_found,38.045,True,,,,
+3,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N3.xlsx,15139,9239,9124,9124,9118,36.0,0.0,no_stable_segment_found,37.519999999999996,True,,,,
+4,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N4.xlsx,14747,9210,9085,9085,9079,36.0,0.0,no_stable_segment_found,37.185,True,,,,
+5,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N5.xlsx,16867,9574,9446,9446,9440,36.0,0.0,no_stable_segment_found,37.415,True,,,,
+6,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N6.xlsx,14978,9271,9178,9178,9172,36.0,0.0,no_stable_segment_found,38.04333333333333,True,,,,
+7,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N7.xlsx,13039,8873,8497,7633,7627,36.0,156.83333333333334,stable_window_detected,37.91,True,6.0,12.0,35.0,0.4
+8,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N8.xlsx,11527,8520,8405,7541,7535,36.0,164.33333333333334,stable_window_detected,36.485,True,6.0,12.0,35.0,0.4
+9,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N9.xlsx,4525,5382,5380,5380,5374,36.0,0.0,no_stable_segment_found,37.41,True,,,,
+10,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N10.xlsx,5849,6392,6390,6390,6384,36.0,0.0,no_stable_segment_found,36.67,True,,,,
+11,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N11.xlsx,6904,7186,7184,7184,7178,36.0,0.0,no_stable_segment_found,36.56,True,,,,
+12,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N12.xlsx,6831,7109,7107,7107,7101,36.0,0.0,no_stable_segment_found,36.54,True,,,,
+13,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N13.xlsx,6621,6583,6581,6581,6575,36.0,0.0,no_stable_segment_found,20.83,True,,,,
+14,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N14.xlsx,6855,6696,6622,6622,6616,36.0,0.0,no_stable_segment_found,20.095,True,,,,
+15,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N15.xlsx,8600,8136,8060,7196,7190,36.0,192.66666666666666,stable_window_detected,37.2,True,6.0,12.0,35.0,0.4
+16,C:\Users\mayue\Desktop\Wavelet\Wavelet\Natural torpor N1-16\N16.xlsx,7177,7465,7392,7392,7386,36.0,0.0,no_stable_segment_found,20.25,True,,,,
