@@ -1,0 +1,19 @@
+{
+  "tag": "GMM",
+  "label_col": "is_torpor_GMM",
+  "deep_thr": 0.9999999982419978,
+  "gray_thr": 0.09158950591437018,
+  "fasting_start": "2023-09-05 12:00:00",
+  "drop_first_days": 2.0,
+  "feature_cols": [
+    "T_rel",
+    "Slope",
+    "T_rel_lag15",
+    "T_rel_lag30"
+  ],
+  "time_clip": [
+    0.001,
+    0.999
+  ],
+  "keep_neg_ratio": 5.0
+}
