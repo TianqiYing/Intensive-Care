@@ -1,0 +1,768 @@
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+from scipy.optimize import curve_fit, minimize
+from scipy.integrate import solve_ivp
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score
+import openpyxl
+
+warnings.filterwarnings('ignore')
+plt.rcParams.update({
+    'font.size': 11, 'figure.dpi': 150,
+    'axes.grid': True, 'grid.alpha': 0.3,
+    'figure.facecolor': 'white'
+})
+
+#  Constants
+FASTING_START = datetime(2023, 9, 5, 12, 0, 0)
+TORPOR_THRESH = 34.0
+T_AMB = 22.0
+OMEGA = 2 * np.pi / 24
+
+STATE_COLORS = {
+    'euthermia': '#4CAF50',
+    'entry':     '#2196F3',
+    'torpor':    '#9C27B0',
+    'arousal':   '#FF5722'
+}
+
+
+#  Data Loading
+def load_data(filepath):
+    """Load xlsx temperature data, filter anomalies, resample to 5min"""
+    wb = openpyxl.load_workbook(filepath)
+    ws = wb.active
+    times, temps = [], []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:
+            continue
+        if row[0] is not None and row[1] is not None:
+            t = row[0]
+            if isinstance(t, datetime) and datetime(2023, 1, 1) <= t <= datetime(2024, 1, 1):
+                try:
+                    temps.append(float(row[1]))
+                    times.append(t)
+                except (ValueError, TypeError):
+                    continue
+    wb.close()
+
+    if len(times) < 100:
+        raise ValueError(f"Insufficient data: only {len(times)} valid rows")
+
+    df = pd.DataFrame({'timestamp': times, 'T': temps})
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    df = df.set_index('timestamp').resample('5min').mean().dropna().reset_index()
+
+    # Remove cold start: consecutive 12 points (1h) > 30°C
+    T = df['T'].values
+    count, start = 0, 0
+    for i in range(len(T)):
+        if T[i] >= 30:
+            count += 1
+            if count >= 12:
+                start = i - 11
+                break
+        else:
+            count = 0
+    df = df.iloc[start:].reset_index(drop=True)
+
+    df['hour_of_day'] = df['timestamp'].dt.hour + df['timestamp'].dt.minute / 60
+    df['hours_from_start'] = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds() / 3600
+    return df
+
+
+#  Torpor Bout Detection
+def detect_bouts(df, thresh=TORPOR_THRESH, min_dur=30):
+    """Detect torpor bouts where T < thresh and duration > min_dur minutes"""
+    T = df['T'].values
+    ts = df['timestamp'].values
+    bouts, in_t, bs = [], False, 0
+
+    for i in range(len(T)):
+        if T[i] < thresh and not in_t:
+            in_t, bs = True, i
+        elif T[i] >= thresh and in_t:
+            in_t = False
+            dur = (pd.Timestamp(ts[i]) - pd.Timestamp(ts[bs])).total_seconds() / 60
+            if dur >= min_dur:
+                bouts.append({
+                    'start': pd.Timestamp(ts[bs]),
+                    'end': pd.Timestamp(ts[i]),
+                    'duration_min': dur,
+                    'min_temp': float(T[bs:i].min()),
+                    'mean_temp': float(T[bs:i].mean()),
+                })
+    return bouts
+
+
+#  Circadian Rhythm Fitting
+def fit_circadian(df):
+    """Fit T(t) = C0 + R*cos(wt - phi) using pre-fasting data"""
+    bl = df[(df['timestamp'] < FASTING_START) & (df['T'] > 30)]
+    if len(bl) < 50:
+        bl = df[df['T'] > 30].head(288)
+    if len(bl) < 20:
+        return None
+
+    hours = bl['hour_of_day'].values
+    temps = bl['T'].values
+
+    bins = np.arange(0, 24.5, 0.5)
+    bc, bm = [], []
+    for i in range(len(bins) - 1):
+        m = (hours >= bins[i]) & (hours < bins[i + 1])
+        if m.sum() > 0:
+            bc.append((bins[i] + bins[i + 1]) / 2)
+            bm.append(temps[m].mean())
+
+    if len(bc) < 10:
+        return None
+
+    func = lambda t, C0, R, phi: C0 + R * np.cos(OMEGA * t - phi)
+    try:
+        popt, _ = curve_fit(func, np.array(bc), np.array(bm), p0=[36.5, 0.8, 3.0])
+    except Exception:
+        return None
+
+    C0, R, phi = popt
+    pred = func(np.array(bc), *popt)
+    ss_res = np.sum((np.array(bm) - pred) ** 2)
+    ss_tot = np.sum((np.array(bm) - np.mean(bm)) ** 2)
+    R2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    return {'C0': C0, 'R': R, 'phi': phi, 'R2': R2}
+
+
+#  ODE Model
+def ode_rhs(t, T_val, alpha, beta, T_torpor, ratio, C0, R, phi, is_torpor_func):
+    """dT/dt = alpha_eff*(Tset - T) + beta*(Tamb - T)"""
+    hod = t % 24
+    torpor = is_torpor_func(t)
+    Tset = T_torpor if torpor else (C0 + R * np.cos(OMEGA * hod - phi))
+    a = alpha * ratio if torpor else alpha
+    return a * (Tset - T_val) + beta * (T_AMB - T_val)
+
+
+def simulate_ode(t_span, T0, params, is_torpor_func):
+    t_eval = np.arange(t_span[0], t_span[1], 0.02)
+    sol = solve_ivp(
+        lambda t, y: ode_rhs(t, y[0], **params, is_torpor_func=is_torpor_func),
+        t_span, [T0], t_eval=t_eval, method='RK45', max_step=0.1
+    )
+    return sol.t, sol.y[0]
+
+
+def fit_ode(df, bouts, circ):
+    """Fit 4 ODE parameters: alpha, beta, T_torpor, ratio"""
+    if not bouts or circ is None:
+        return None
+
+    t0 = bouts[0]['start'] - timedelta(hours=2)
+    t1 = bouts[-1]['end'] + timedelta(hours=3)
+    sub = df[(df['timestamp'] >= t0) & (df['timestamp'] <= t1)]
+    if len(sub) < 20:
+        return None
+
+    ref = sub['timestamp'].iloc[0]
+    td = (sub['timestamp'] - ref).dt.total_seconds().values / 3600
+    Td = sub['T'].values
+
+    intervals = [((b['start'] - ref).total_seconds() / 3600,
+                  (b['end'] - ref).total_seconds() / 3600) for b in bouts]
+
+    def is_torpor(t):
+        return any(s <= t <= e for s, e in intervals)
+
+    C0, R, phi = circ['C0'], circ['R'], circ['phi']
+
+    def objective(p):
+        a, b, Tt, r = p
+        if a < 0.1 or b < 0 or Tt < 15 or Tt > 35 or r < 0.01 or r > 1:
+            return 1e10
+        params = dict(alpha=a, beta=b, T_torpor=Tt, ratio=r, C0=C0, R=R, phi=phi)
+        try:
+            ts, Ts = simulate_ode((td[0], td[-1]), Td[0], params, is_torpor)
+            Tp = np.interp(td, ts, Ts)
+            return np.sum((Td - Tp) ** 2)
+        except Exception:
+            return 1e10
+
+    res = minimize(objective, x0=[2.0, 0.3, 28.0, 0.3],
+                   method='Nelder-Mead', options={'maxiter': 5000, 'xatol': 1e-4})
+    alpha, beta, T_torpor, ratio = res.x
+
+    best_params = dict(alpha=alpha, beta=beta, T_torpor=T_torpor, ratio=ratio, C0=C0, R=R, phi=phi)
+    ts, Ts = simulate_ode((td[0], td[-1]), Td[0], best_params, is_torpor)
+    Tp = np.interp(td, ts, Ts)
+    rmse = np.sqrt(np.mean((Td - Tp) ** 2))
+
+    ss_res = np.sum((Td - Tp) ** 2)
+    ss_tot = np.sum((Td - np.mean(Td)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    # Baseline simulation without torpor
+    ts_bl, Ts_bl = simulate_ode((td[0], td[-1]), Td[0], best_params, lambda t: False)
+
+    return {
+        'alpha': alpha, 'beta': beta, 'T_torpor': T_torpor, 'ratio': ratio,
+        'rmse': rmse, 'r2': r2,
+        'td': td, 'Td': Td, 'ts': ts, 'Ts': Ts, 'ts_bl': ts_bl, 'Ts_bl': Ts_bl,
+        'Tp': Tp, 'ref': ref, 'intervals': intervals
+    }
+
+
+#  ODE Cross-Validation
+def validate_ode(df, bouts, circ, ext_params):
+    """Predict using mean parameters from other individuals on current individual"""
+    if not bouts or circ is None:
+        return None
+
+    t0 = bouts[0]['start'] - timedelta(hours=2)
+    t1 = bouts[-1]['end'] + timedelta(hours=3)
+    sub = df[(df['timestamp'] >= t0) & (df['timestamp'] <= t1)]
+    if len(sub) < 20:
+        return None
+
+    ref = sub['timestamp'].iloc[0]
+    td = (sub['timestamp'] - ref).dt.total_seconds().values / 3600
+    Td = sub['T'].values
+
+    intervals = [((b['start'] - ref).total_seconds() / 3600,
+                  (b['end'] - ref).total_seconds() / 3600) for b in bouts]
+
+    def is_torpor(t):
+        return any(s <= t <= e for s, e in intervals)
+
+    params = dict(
+        alpha=ext_params['alpha'], beta=ext_params['beta'],
+        T_torpor=ext_params['T_torpor'], ratio=ext_params['ratio'],
+        C0=circ['C0'], R=circ['R'], phi=circ['phi']
+    )
+    try:
+        ts, Ts = simulate_ode((td[0], td[-1]), Td[0], params, is_torpor)
+        Tp = np.interp(td, ts, Ts)
+        rmse = np.sqrt(np.mean((Td - Tp) ** 2))
+        ss_res = np.sum((Td - Tp) ** 2)
+        ss_tot = np.sum((Td - np.mean(Td)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+        return {'rmse_cv': rmse, 'r2_cv': r2, 'Tp_cv': Tp, 'td': td, 'Td': Td}
+    except Exception:
+        return None
+
+
+#  GMM Clustering
+def build_features(df):
+    d = df.copy()
+    bl = d[d['timestamp'] < FASTING_START]['T']
+    if len(bl) < 10:
+        bl = d['T'].iloc[:288]
+    baseline = float(bl.median())
+
+    d['T_rel'] = d['T'] - baseline
+    w = 6
+    d['dT_dt'] = d['T'].diff(w) / (w * 5 / 60)
+    d['dT_dt_log'] = np.sign(d['dT_dt']) * np.log1p(np.abs(d['dT_dt']))
+    d['T_rel_lag1'] = d['T_rel'].shift(3)
+    d['T_rel_lag2'] = d['T_rel'].shift(6)
+
+    feat_cols = ['T_rel', 'dT_dt_log', 'T_rel_lag1', 'T_rel_lag2']
+    d = d.dropna(subset=feat_cols).reset_index(drop=True)
+    return d, feat_cols, baseline
+
+
+def run_gmm(df, feat_cols, max_k=8):
+    X = df[feat_cols].values
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+
+    bics = {}
+    sils = {}
+    gmms = {}
+    for k in range(2, max_k + 1):
+        gmm = GaussianMixture(n_components=k, covariance_type='full',
+                               reg_covar=1e-6, random_state=42, n_init=3)
+        labels = gmm.fit_predict(Xz)
+        bics[k] = gmm.bic(Xz)
+        sils[k] = silhouette_score(Xz, labels)
+        gmms[k] = gmm
+
+    # K selection strategy:
+    # 1. Try BIC elbow point (max second derivative)
+    # 2. If BIC monotonically decreasing, use K with max Silhouette
+    # 3. Constrain K ∈ [3, 6] (physiologically reasonable)
+    ks = sorted(bics.keys())
+    bic_vals = [bics[k] for k in ks]
+
+    best_k = None
+    # Elbow detection: second derivative
+    if len(ks) >= 3:
+        d1 = [bic_vals[i+1] - bic_vals[i] for i in range(len(bic_vals)-1)]
+        d2 = [d1[i+1] - d1[i] for i in range(len(d1)-1)]
+        # Elbow = max d2 (point where BIC decrease slows most)
+        knee_idx = np.argmax(d2) + 1  # +1 because d2 is shorter than ks by 2
+        best_k = ks[knee_idx]
+
+    # If elbow K not in reasonable range, or silhouette too low, fallback
+    reasonable_ks = [k for k in ks if 3 <= k <= 6]
+    if not reasonable_ks:
+        reasonable_ks = ks
+
+    if best_k is None or best_k < 3 or best_k > 6:
+        # Select best silhouette within reasonable range
+        best_k = max(reasonable_ks, key=lambda k: sils[k])
+
+    # Final check: if silhouette < 0.15, try smaller K
+    if sils[best_k] < 0.15:
+        candidates = [k for k in reasonable_ks if k <= best_k]
+        if candidates:
+            alt_k = max(candidates, key=lambda k: sils[k])
+            if sils[alt_k] > sils[best_k]:
+                best_k = alt_k
+
+    gmm_best = gmms[best_k]
+    df = df.copy()
+    df['cluster'] = gmm_best.predict(Xz)
+    sil = sils[best_k]
+
+    # Semantic labeling
+    stats = df.groupby('cluster').agg(mT=('T_rel', 'mean'), mD=('dT_dt_log', 'mean'))
+    stats = stats.sort_values('mT')
+    ids = stats.index.tolist()
+
+    label_map = {}
+    if len(ids) >= 4:
+        label_map[ids[0]] = 'torpor'
+        label_map[ids[-1]] = 'euthermia'
+        for c in ids[1:-1]:
+            label_map[c] = 'entry' if stats.loc[c, 'mD'] < 0 else 'arousal'
+    elif len(ids) == 3:
+        label_map[ids[0]] = 'torpor'
+        label_map[ids[-1]] = 'euthermia'
+        label_map[ids[1]] = 'entry' if stats.loc[ids[1], 'mD'] < 0 else 'arousal'
+    else:
+        for c in ids:
+            label_map[c] = 'torpor' if stats.loc[c, 'mT'] < -2 else 'euthermia'
+
+    df['state'] = df['cluster'].map(label_map)
+    return df, bics, sils, best_k, sil, label_map
+
+
+#  Single Individual Analysis
+def analyze_one(filepath, animal_id, out_dir):
+    print(f"\n{'='*60}")
+    print(f"  Analyzing: {animal_id} ({os.path.basename(filepath)})")
+    print(f"{'='*60}")
+
+    result = {'id': animal_id, 'file': os.path.basename(filepath), 'status': 'ok'}
+    adir = os.path.join(out_dir, animal_id)
+    os.makedirs(adir, exist_ok=True)
+
+    # 1. Load data
+    try:
+        df = load_data(filepath)
+        result['n_points'] = len(df)
+        result['t_start'] = str(df['timestamp'].iloc[0])
+        result['t_end'] = str(df['timestamp'].iloc[-1])
+    except Exception as e:
+        result['status'] = f'load_error: {e}'
+        print(f"  ✗ Load failed: {e}")
+        return result, None, None, None, None
+
+    # 2. Torpor detection
+    bouts = detect_bouts(df)
+    result['n_bouts'] = len(bouts)
+    if bouts:
+        result['bout_durations'] = [round(b['duration_min'], 1) for b in bouts]
+        result['bout_min_temps'] = [round(b['min_temp'], 2) for b in bouts]
+        result['deepest_temp'] = min(b['min_temp'] for b in bouts)
+        result['mean_bout_dur'] = np.mean([b['duration_min'] for b in bouts])
+        print(f"  Torpor: {len(bouts)} bouts, deepest {result['deepest_temp']:.1f}°C")
+    else:
+        print(f"  Torpor: None")
+
+    # 3. Circadian rhythm
+    circ = fit_circadian(df)
+    if circ:
+        result['circ_C0'] = round(circ['C0'], 3)
+        result['circ_R'] = round(circ['R'], 4)
+        result['circ_phi'] = round(circ['phi'], 4)
+        result['circ_R2'] = round(circ['R2'], 4)
+        print(f"  Circadian: C0={circ['C0']:.2f}, R={circ['R']:.3f}, R²={circ['R2']:.3f}")
+    else:
+        print(f"  Circadian: Fit failed")
+
+    # 4. ODE fitting
+    ode_result = fit_ode(df, bouts, circ)
+    if ode_result:
+        for k in ['alpha', 'beta', 'T_torpor', 'ratio', 'rmse', 'r2']:
+            result[f'ode_{k}'] = round(ode_result[k], 4)
+        print(f"  ODE: α={ode_result['alpha']:.3f}, β={ode_result['beta']:.3f}, "
+              f"T_torpor={ode_result['T_torpor']:.1f}, ratio={ode_result['ratio']:.3f}, "
+              f"RMSE={ode_result['rmse']:.2f}, R²={ode_result['r2']:.3f}")
+    else:
+        print(f"  ODE: Fit failed")
+
+    # 5. GMM clustering
+    df_feat = None
+    bics_dict = None
+    sils_dict = None
+    best_k = None
+    try:
+        df_feat, feat_cols, baseline = build_features(df)
+        df_feat, bics_dict, sils_dict, best_k, sil, label_map = run_gmm(df_feat, feat_cols)
+        result['gmm_K'] = best_k
+        result['gmm_silhouette'] = round(sil, 4)
+        result['gmm_baseline'] = round(baseline, 2)
+        for state in ['euthermia', 'entry', 'torpor', 'arousal']:
+            n = (df_feat['state'] == state).sum()
+            result[f'gmm_pct_{state}'] = round(100 * n / len(df_feat), 1) if len(df_feat) > 0 else 0
+        print(f"  GMM: K={best_k}, Silhouette={sil:.3f}")
+    except Exception as e:
+        print(f"  GMM: Failed ({e})")
+
+    # 6. Individual plots
+    _plot_individual(df, bouts, circ, ode_result, df_feat, bics_dict,
+                     sils_dict if df_feat is not None else None, best_k, animal_id, adir)
+
+    return result, df, bouts, circ, ode_result
+
+
+#  Individual Plots
+def _plot_individual(df, bouts, circ, ode_result, df_feat, bics, sils, best_k, animal_id, adir):
+
+    # Figure 1: Full time series overview
+    fig, ax = plt.subplots(figsize=(14, 3.5))
+    ax.plot(df['timestamp'], df['T'], color='#2196F3', linewidth=0.3)
+    ax.axvline(FASTING_START, color='red', linestyle='--', lw=1.2, label='Fasting')
+    ax.axhline(TORPOR_THRESH, color='orange', linestyle=':', alpha=0.7)
+    for b in bouts:
+        ax.axvspan(b['start'], b['end'], alpha=0.2, color='purple')
+    ax.set_ylabel('T (°C)')
+    ax.set_ylim(22, 40)
+    ax.set_title(f'{animal_id} — Overview ({len(bouts)} torpor bouts)', fontweight='bold')
+    ax.legend(fontsize=8, loc='lower left')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+    plt.tight_layout()
+    plt.savefig(os.path.join(adir, 'overview.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Figure 2: Circadian rhythm
+    if circ:
+        bl = df[(df['timestamp'] < FASTING_START) & (df['T'] > 30)]
+        if len(bl) > 0:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.scatter(bl['hour_of_day'], bl['T'], s=0.5, alpha=0.15, color='#2196F3')
+            t_fit = np.linspace(0, 24, 200)
+            T_fit = circ['C0'] + circ['R'] * np.cos(OMEGA * t_fit - circ['phi'])
+            ax.plot(t_fit, T_fit, 'r-', lw=2,
+                    label=f"C0={circ['C0']:.1f}, R={circ['R']:.2f}, R²={circ['R2']:.3f}")
+            ax.set_xlabel('Hour of Day')
+            ax.set_ylabel('T (°C)')
+            ax.set_title(f'{animal_id} — Circadian Fit', fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.set_xlim(0, 24)
+            plt.tight_layout()
+            plt.savefig(os.path.join(adir, 'circadian.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+
+    # Figure 3: ODE fitting
+    if ode_result:
+        r = ode_result
+        fig, axes = plt.subplots(2, 1, figsize=(13, 6), height_ratios=[2.5, 1],
+                                 gridspec_kw={'hspace': 0.35})
+        ax = axes[0]
+        ax.plot(r['td'], r['Td'], 'b.', ms=1.5, alpha=0.3, label='Observed')
+        ax.plot(r['ts'], r['Ts'], 'r-', lw=1.5, label='ODE fit')
+        ax.plot(r['ts_bl'], r['Ts_bl'], 'g--', lw=1, alpha=0.4, label='No-torpor baseline')
+        for s, e in r['intervals']:
+            ax.axvspan(s, e, alpha=0.1, color='purple')
+        ax.axhline(TORPOR_THRESH, color='orange', linestyle=':', alpha=0.5)
+        ax.set_ylabel('T (°C)')
+        ax.set_title(f'{animal_id} — ODE (RMSE={r["rmse"]:.2f}°C, R²={r["r2"]:.3f})', fontweight='bold')
+        ax.legend(fontsize=9)
+
+        ax = axes[1]
+        ax.plot(r['td'], r['Td'] - r['Tp'], 'k.', ms=1, alpha=0.3)
+        ax.axhline(0, color='gray')
+        ax.set_xlabel(f'Hours from {r["ref"].strftime("%H:%M %b %d")}')
+        ax.set_ylabel('Residual (°C)')
+        plt.tight_layout()
+        plt.savefig(os.path.join(adir, 'ode_fit.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Figure 4: BIC + Silhouette
+    if bics and best_k:
+        fig, ax1 = plt.subplots(figsize=(7, 4.5))
+        ks = sorted(bics.keys())
+        ax1.plot(ks, [bics[k] for k in ks], 'bo-', lw=2, ms=8, label='BIC')
+        ax1.set_xlabel('K')
+        ax1.set_ylabel('BIC', color='blue')
+        ax1.axvline(best_k, color='red', linestyle='--', lw=1.5, label=f'Selected K={best_k}')
+
+        if sils:
+            ax2 = ax1.twinx()
+            ax2.plot(ks, [sils[k] for k in ks], 'gs--', lw=1.5, ms=7, alpha=0.7, label='Silhouette')
+            ax2.set_ylabel('Silhouette', color='green')
+            ax2.legend(loc='center right', fontsize=8)
+
+        ax1.set_title(f'{animal_id} — Model Selection', fontweight='bold')
+        ax1.legend(loc='upper right', fontsize=8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(adir, 'bic.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Figure 5: Phase portrait
+    if df_feat is not None and 'state' in df_feat.columns:
+        fig, ax = plt.subplots(figsize=(7, 5.5))
+        for state, c in STATE_COLORS.items():
+            sub = df_feat[df_feat['state'] == state]
+            if len(sub) > 0:
+                ax.scatter(sub['T_rel'], sub['dT_dt_log'], s=2, alpha=0.3, c=c, label=state)
+        ax.set_xlabel('ΔT (°C)')
+        ax.set_ylabel('dT/dt (log)')
+        ax.set_title(f'{animal_id} — Phase Portrait (K={best_k})', fontweight='bold')
+        ax.legend(markerscale=6, fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(adir, 'phase.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # Figure 6: Time series colored by state
+    if df_feat is not None and 'state' in df_feat.columns:
+        fig, ax = plt.subplots(figsize=(14, 3.5))
+        color_arr = df_feat['state'].map(STATE_COLORS).fillna('gray')
+        ax.scatter(df_feat['timestamp'], df_feat['T'], c=color_arr, s=2, alpha=0.5)
+        for state, c in STATE_COLORS.items():
+            ax.scatter([], [], c=c, s=40, label=state)
+        ax.axhline(TORPOR_THRESH, color='orange', linestyle=':', alpha=0.5)
+        ax.set_ylabel('T (°C)')
+        ax.set_title(f'{animal_id} — State Classification', fontweight='bold')
+        ax.legend(fontsize=8, loc='lower left', markerscale=2, ncol=4)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+        plt.tight_layout()
+        plt.savefig(os.path.join(adir, 'states.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+#  Cross-Individual Summary Plots
+def plot_summary(summary_df, cv_df, out_dir):
+    has_ode = summary_df.dropna(subset=['ode_alpha'])
+    has_bouts = summary_df[summary_df['n_bouts'] > 0]
+
+    # Figure 1: ODE parameter comparison
+    if len(has_ode) >= 2:
+        params = ['ode_alpha', 'ode_beta', 'ode_T_torpor', 'ode_ratio']
+        labels = ['α (hr⁻¹)', 'β (hr⁻¹)', 'T_torpor (°C)', 'ratio']
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        for ax, p, lab in zip(axes, params, labels):
+            vals = has_ode[p].values
+            ids_arr = has_ode['id'].values
+            ax.barh(ids_arr, vals, color='#2196F3', alpha=0.7)
+            ax.axvline(np.mean(vals), color='red', linestyle='--', lw=1.5,
+                       label=f'mean={np.mean(vals):.3f}')
+            ax.set_xlabel(lab)
+            ax.legend(fontsize=7)
+        fig.suptitle('ODE Parameters Across Individuals', fontweight='bold', fontsize=13)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, 'summary_ode_params.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  [✓] summary_ode_params.png")
+
+    # Figure 2: Torpor characteristics
+    if len(has_bouts) >= 2:
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        ids_arr = has_bouts['id'].values
+        axes[0].barh(ids_arr, has_bouts['n_bouts'].values, color='#9C27B0', alpha=0.7)
+        axes[0].set_xlabel('Count')
+        axes[0].set_title('Torpor Bout Count')
+        axes[1].barh(ids_arr, has_bouts['mean_bout_dur'].values, color='#FF5722', alpha=0.7)
+        axes[1].set_xlabel('Duration (min)')
+        axes[1].set_title('Mean Bout Duration')
+        axes[2].barh(ids_arr, has_bouts['deepest_temp'].values, color='#2196F3', alpha=0.7)
+        axes[2].set_xlabel('T (°C)')
+        axes[2].set_title('Deepest Temperature')
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, 'summary_torpor.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  [✓] summary_torpor.png")
+
+    # Figure 3: Cross-validation comparison
+    if cv_df is not None and len(cv_df) >= 2:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        ids_arr = cv_df['id'].values
+        x = np.arange(len(ids_arr))
+        w = 0.35
+        ax = axes[0]
+        ax.bar(x - w / 2, cv_df['rmse_fit'].values, w, label='Fit (self)', color='#4CAF50', alpha=0.8)
+        ax.bar(x + w / 2, cv_df['rmse_cv'].values, w, label='LOO-CV', color='#FF5722', alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(ids_arr, rotation=30)
+        ax.set_ylabel('RMSE (°C)')
+        ax.set_title('RMSE: Fit vs LOO-CV', fontweight='bold')
+        ax.legend()
+        ax = axes[1]
+        ax.bar(x - w / 2, cv_df['r2_fit'].values, w, label='Fit', color='#4CAF50', alpha=0.8)
+        ax.bar(x + w / 2, cv_df['r2_cv'].values, w, label='LOO-CV', color='#FF5722', alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(ids_arr, rotation=30)
+        ax.set_ylabel('R²')
+        ax.set_title('R²: Fit vs LOO-CV', fontweight='bold')
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, 'summary_cv.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  [✓] summary_cv.png")
+
+    # Figure 4: GMM
+    gmm_data = summary_df.dropna(subset=['gmm_K'])
+    if len(gmm_data) >= 2:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        ids_arr = gmm_data['id'].values
+        axes[0].barh(ids_arr, gmm_data['gmm_K'].values, color='#9C27B0', alpha=0.7)
+        axes[0].set_xlabel('K')
+        axes[0].set_title('Optimal K (BIC)')
+        axes[1].barh(ids_arr, gmm_data['gmm_silhouette'].values, color='#FF9800', alpha=0.7)
+        axes[1].set_xlabel('Silhouette')
+        axes[1].set_title('Clustering Quality')
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, 'summary_gmm.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  [✓] summary_gmm.png")
+
+
+#  Main Program
+def main():
+    parser = argparse.ArgumentParser(description='Batch analysis of torpor body temperature')
+    parser.add_argument('--data_dir', default='Natural torpor N1-16',
+                        help='Directory containing N1-N16 data')
+    parser.add_argument('--out', default='results', help='Output directory')
+    parser.add_argument('--max_k', type=int, default=8, help='Maximum K for GMM')
+    args = parser.parse_args()
+
+    out_dir = args.out
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Find files
+    data_dir = args.data_dir
+    files = {}
+    if os.path.isdir(data_dir):
+        for fn in sorted(os.listdir(data_dir)):
+            if fn.endswith('.xlsx') and not fn.startswith('~$'):
+                aid = fn.replace('.xlsx', '')
+                files[aid] = os.path.join(data_dir, fn)
+    elif os.path.isfile(data_dir):
+        aid = os.path.basename(data_dir).replace('.xlsx', '')
+        files[aid] = data_dir
+
+    if not files:
+        print(f"No data files found! (data_dir={data_dir})")
+        sys.exit(1)
+
+    print(f"Found {len(files)} files: {list(files.keys())}")
+
+    #  Phase 1: Individual analysis
+    all_results = []
+    all_data = {}
+
+    for aid, fpath in files.items():
+        try:
+            result, df, bouts, circ, ode_result = analyze_one(fpath, aid, out_dir)
+            all_results.append(result)
+            if df is not None:
+                all_data[aid] = (df, bouts, circ, ode_result)
+        except Exception as e:
+            print(f"  ✗ {aid} exception: {e}")
+            traceback.print_exc()
+            all_results.append({'id': aid, 'status': f'error: {e}'})
+
+    #  Phase 2: Summary table
+    summary_df = pd.DataFrame(all_results)
+    # Remove list-type columns for CSV saving
+    csv_cols = [c for c in summary_df.columns if c not in ('bout_durations', 'bout_min_temps')]
+    summary_df[csv_cols].to_csv(os.path.join(out_dir, 'summary.csv'), index=False)
+    print(f"\nSummary table → {out_dir}/summary.csv")
+
+    ok = summary_df[summary_df['status'] == 'ok']
+    print(f"\nSuccessful: {len(ok)}/{len(summary_df)} individuals")
+
+    if 'ode_alpha' in ok.columns:
+        has_ode = ok.dropna(subset=['ode_alpha'])
+        if len(has_ode) > 0:
+            print(f"\nODE parameter mean ± std (n={len(has_ode)}):")
+            for p, unit in [('ode_alpha', 'hr⁻¹'), ('ode_beta', 'hr⁻¹'),
+                            ('ode_T_torpor', '°C'), ('ode_ratio', '')]:
+                if p in has_ode.columns:
+                    vals = has_ode[p].dropna()
+                    if len(vals) > 1:
+                        print(f"  {p}: {vals.mean():.3f} ± {vals.std():.3f} {unit}")
+                    else:
+                        print(f"  {p}: {vals.mean():.3f} {unit} (n=1)")
+
+    #  Phase 3: LOO cross-validation
+    print(f"\n{'='*60}")
+    print("  Leave-One-Out Cross-Validation")
+    print(f"{'='*60}")
+
+    ode_ids = [aid for aid, (df, bouts, circ, ode_r) in all_data.items()
+               if ode_r is not None]
+
+    cv_results = []
+    if len(ode_ids) >= 2:
+        for test_id in ode_ids:
+            train_ids = [x for x in ode_ids if x != test_id]
+            train_params = {}
+            for p in ['alpha', 'beta', 'T_torpor', 'ratio']:
+                vals = [all_data[x][3][p] for x in train_ids]
+                train_params[p] = np.mean(vals)
+
+            df, bouts, circ, ode_r = all_data[test_id]
+            cv = validate_ode(df, bouts, circ, train_params)
+            if cv:
+                cv_results.append({
+                    'id': test_id,
+                    'rmse_fit': ode_r['rmse'],
+                    'r2_fit': ode_r['r2'],
+                    'rmse_cv': cv['rmse_cv'],
+                    'r2_cv': cv['r2_cv'],
+                    'rmse_increase': cv['rmse_cv'] - ode_r['rmse'],
+                })
+                print(f"  {test_id}: RMSE_fit={ode_r['rmse']:.2f} → RMSE_cv={cv['rmse_cv']:.2f} "
+                      f"(Δ={cv['rmse_cv'] - ode_r['rmse']:+.2f}°C)")
+
+        cv_df = pd.DataFrame(cv_results)
+        cv_df.to_csv(os.path.join(out_dir, 'cross_validation.csv'), index=False)
+        print(f"\n  → {out_dir}/cross_validation.csv")
+        if len(cv_df) > 0:
+            print(f"  Mean RMSE_fit = {cv_df['rmse_fit'].mean():.2f}°C")
+            print(f"  Mean RMSE_cv  = {cv_df['rmse_cv'].mean():.2f}°C")
+    else:
+        cv_df = None
+        print("  Less than 2 valid ODE individuals, skipping")
+
+    #  Phase 4: Cross-individual comparison plots
+    print(f"\nGenerating summary plots → {out_dir}/")
+    plot_summary(summary_df, cv_df, out_dir)
+
+    # Save mean parameters
+    if len(ode_ids) > 0:
+        mean_params = {}
+        for p in ['alpha', 'beta', 'T_torpor', 'ratio']:
+            vals = [all_data[x][3][p] for x in ode_ids]
+            mean_params[p] = round(float(np.mean(vals)), 4)
+            mean_params[f'{p}_std'] = round(float(np.std(vals)), 4)
+        with open(os.path.join(out_dir, 'mean_ode_params.json'), 'w') as f:
+            json.dump(mean_params, f, indent=2)
+        print("  [✓] mean_ode_params.json")
+
+    print(f"\n{'='*60}")
+    print(f"  Done! Results → {out_dir}/")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
